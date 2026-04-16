@@ -20,10 +20,21 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb ffmpeg unzip
-          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
-          sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list'
+          sudo apt-get install -y \
+            xvfb ffmpeg unzip wget gnupg ca-certificates fontconfig \
+            fonts-noto-cjk \
+            fonts-noto-color-emoji \
+            fonts-wqy-zenhei \
+            fonts-wqy-microhei \
+            fonts-liberation
+
+          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor | sudo tee /usr/share/keyrings/google-linux.gpg >/dev/null
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
           sudo apt-get install -y google-chrome-stable
+
+          fc-cache -fv
+          fc-list | grep -i "Noto\|WenQuanYi" | head -20
 
       - name: 🛡️ 生成并启动 sing-box 代理
         env:
