@@ -1,9 +1,8 @@
 name: Auto Renew Server Script
 
 on:
-  workflow_dispatch:
-  schedule:
-   - cron: '0 0,8,16 * * *'
+  repository_dispatch:
+    types: [vps]
 
 jobs:
   run-renew:
