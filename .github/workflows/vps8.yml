@@ -39,7 +39,7 @@ jobs:
       - name: 🛡️ 生成并启动 sing-box 代理
         env:
           PROXY_STR: ${{ secrets.PROXY_STR }}
-          SING_BOX_VERSION: 1.12.12
+          SING_BOX_VERSION: 1.8.10
         run: |
           python generate_singbox_config.py
           wget https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-amd64.tar.gz
