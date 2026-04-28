@@ -2,7 +2,25 @@ import os
 import json
 import base64
 import sys
+import re
 from urllib.parse import urlparse, parse_qs, unquote
+
+def fix_ipv6_url(url):
+    """修复纯 IPv6 地址的 URL，确保 urlparse 能正确解析"""
+    # 匹配 scheme://userinfo@IPv6:port 的情况（IPv6 没有方括号）
+    # 例如 tuic://uuid:pass@2001:db8::1:443?... 需要变成 tuic://uuid:pass@[2001:db8::1]:443?...
+    pattern = r'^(\w+://)([^@]+@)?(?!\[)([\da-fA-F:]+):(\d+)(.*)$'
+    match = re.match(pattern, url)
+    if match:
+        scheme_part = match.group(1)
+        userinfo = match.group(2) or ""
+        host = match.group(3)
+        port = match.group(4)
+        rest = match.group(5) or ""
+        # 判断 host 是否是 IPv6（包含多个冒号）
+        if host.count(':') >= 2:
+            return f"{scheme_part}{userinfo}[{host}]:{port}{rest}"
+    return url
 
 def generate_config(proxy_url):
     # 如果已经是 JSON 格式，直接原样返回
@@ -14,6 +32,9 @@ def generate_config(proxy_url):
         except:
             pass
 
+    # 修复 IPv6 地址
+    proxy_url = fix_ipv6_url(proxy_url)
+
     # 处理单节点链接
     parsed = urlparse(proxy_url)
     scheme = parsed.scheme.lower()
@@ -23,19 +44,25 @@ def generate_config(proxy_url):
     }
 
     if scheme == "tuic":
-        # tuic://uuid:password@host:port?congestion_control=bbr...
         outbound["type"] = "tuic"
-        outbound["server"] = parsed.hostname
+        outbound["server"] = parsed.hostname  # urlparse 会自动去掉方括号
         outbound["server_port"] = parsed.port
+        
+        if outbound["server"] is None or outbound["server_port"] is None:
+            print(f"Failed to parse TUIC host/port from: {proxy_url}")
+            sys.exit(1)
         
         auth_user = unquote(parsed.username or "")
         auth_pass = unquote(parsed.password or "")
         
-        if ":" in auth_user:
+        if auth_pass:
+            outbound["uuid"] = auth_user
+            outbound["password"] = auth_pass
+        elif ":" in auth_user:
             outbound["uuid"], outbound["password"] = auth_user.split(":", 1)
         else:
             outbound["uuid"] = auth_user
-            outbound["password"] = auth_pass
+            outbound["password"] = ""
         
         params = parse_qs(parsed.query)
         outbound["congestion_control"] = params.get("congestion_control", ["bbr"])[0]
@@ -73,7 +100,6 @@ def generate_config(proxy_url):
             if "fp" in params: outbound["tls"]["utls"] = {"enabled": True, "fingerprint": params["fp"][0]}
             if "pbk" in params: outbound["tls"]["reality"] = {"enabled": True, "public_key": params["pbk"][0], "short_id": params.get("sid", [""])[0]}
         
-        # 传输层配置
         network = params.get("type", ["tcp"])[0]
         if network == "ws":
             outbound["transport"] = {"type": "ws", "path": params.get("path", ["/"])[0], "headers": {"Host": params.get("host", [""])[0]}}
@@ -91,7 +117,6 @@ def generate_config(proxy_url):
         if "sni" in params: outbound["tls"]["server_name"] = params["sni"][0]
 
     elif scheme in ["ss", "shadowsocks"]:
-        # ss://base64(method:password)@host:port
         outbound["type"] = "shadowsocks"
         outbound["server"] = parsed.hostname
         outbound["server_port"] = parsed.port
@@ -106,7 +131,6 @@ def generate_config(proxy_url):
                 outbound["password"] = unquote(parsed.password or "")
 
     elif scheme == "vmess":
-        # vmess://base64(json_config)
         try:
             v_info = json.loads(base64.b64decode(parsed.netloc + "==").decode())
             outbound["type"] = "vmess"
@@ -138,11 +162,9 @@ def generate_config(proxy_url):
             outbound["password"] = passwd
 
     else:
-        # 其他协议回退到直接填入（可能是简单订阅或不支持的协议）
         print(f"Unknown scheme: {scheme}, please use full JSON for complex configs.")
         sys.exit(1)
 
-    # 组装完整配置
     config = {
         "log": {"level": "info"},
         "inbounds": [
