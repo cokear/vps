@@ -7,8 +7,6 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 def fix_ipv6_url(url):
     """修复纯 IPv6 地址的 URL，确保 urlparse 能正确解析"""
-    # 匹配 scheme://userinfo@IPv6:port 的情况（IPv6 没有方括号）
-    # 例如 tuic://uuid:pass@2001:db8::1:443?... 需要变成 tuic://uuid:pass@[2001:db8::1]:443?...
     pattern = r'^(\w+://)([^@]+@)?(?!\[)([\da-fA-F:]+):(\d+)(.*)$'
     match = re.match(pattern, url)
     if match:
@@ -17,13 +15,16 @@ def fix_ipv6_url(url):
         host = match.group(3)
         port = match.group(4)
         rest = match.group(5) or ""
-        # 判断 host 是否是 IPv6（包含多个冒号）
         if host.count(':') >= 2:
             return f"{scheme_part}{userinfo}[{host}]:{port}{rest}"
     return url
 
+def get_insecure(params):
+    """兼容 insecure 和 allow_insecure 两种参数名"""
+    val = params.get("insecure", params.get("allow_insecure", ["0"]))[0]
+    return val in ["1", "true"]
+
 def generate_config(proxy_url):
-    # 如果已经是 JSON 格式，直接原样返回
     proxy_url = proxy_url.strip()
     if proxy_url.startswith('{') and proxy_url.endswith('}'):
         try:
@@ -32,10 +33,12 @@ def generate_config(proxy_url):
         except:
             pass
 
-    # 修复 IPv6 地址
+    # 去掉 fragment（#xxx）
+    proxy_url = proxy_url.split('#')[0]
+
+    # 修复裸 IPv6 地址
     proxy_url = fix_ipv6_url(proxy_url)
 
-    # 处理单节点链接
     parsed = urlparse(proxy_url)
     scheme = parsed.scheme.lower()
     
@@ -45,7 +48,7 @@ def generate_config(proxy_url):
 
     if scheme == "tuic":
         outbound["type"] = "tuic"
-        outbound["server"] = parsed.hostname  # urlparse 会自动去掉方括号
+        outbound["server"] = parsed.hostname
         outbound["server_port"] = parsed.port
         
         if outbound["server"] is None or outbound["server_port"] is None:
@@ -71,7 +74,7 @@ def generate_config(proxy_url):
         outbound["tls"] = {"enabled": True}
         if "sni" in params: outbound["tls"]["server_name"] = params["sni"][0]
         if "alpn" in params: outbound["tls"]["alpn"] = params["alpn"][0].split(',')
-        if "insecure" in params and params["insecure"][0] in ["1", "true"]: outbound["tls"]["insecure"] = True
+        if get_insecure(params): outbound["tls"]["insecure"] = True
 
     elif scheme in ["hysteria2", "hy2"]:
         outbound["type"] = "hysteria2"
@@ -82,7 +85,7 @@ def generate_config(proxy_url):
         params = parse_qs(parsed.query)
         outbound["tls"] = {"enabled": True}
         if "sni" in params: outbound["tls"]["server_name"] = params["sni"][0]
-        if "insecure" in params and params["insecure"][0] in ["1", "true"]: outbound["tls"]["insecure"] = True
+        if get_insecure(params): outbound["tls"]["insecure"] = True
 
     elif scheme == "vless":
         outbound["type"] = "vless"
@@ -99,6 +102,7 @@ def generate_config(proxy_url):
             if "sni" in params: outbound["tls"]["server_name"] = params["sni"][0]
             if "fp" in params: outbound["tls"]["utls"] = {"enabled": True, "fingerprint": params["fp"][0]}
             if "pbk" in params: outbound["tls"]["reality"] = {"enabled": True, "public_key": params["pbk"][0], "short_id": params.get("sid", [""])[0]}
+            if get_insecure(params): outbound["tls"]["insecure"] = True
         
         network = params.get("type", ["tcp"])[0]
         if network == "ws":
@@ -115,6 +119,7 @@ def generate_config(proxy_url):
         params = parse_qs(parsed.query)
         outbound["tls"] = {"enabled": True}
         if "sni" in params: outbound["tls"]["server_name"] = params["sni"][0]
+        if get_insecure(params): outbound["tls"]["insecure"] = True
 
     elif scheme in ["ss", "shadowsocks"]:
         outbound["type"] = "shadowsocks"
