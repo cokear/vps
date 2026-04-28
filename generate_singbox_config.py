@@ -173,7 +173,7 @@ def generate_config(proxy_url):
                 "type": "mixed",
                 "tag": "mixed-in",
                 "listen": "127.0.0.1",
-                "listen_port": 8080
+                "listen_port": 1080
             }
         ],
         "outbounds": [
