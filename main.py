@@ -1,574 +1,301 @@
-# -*- coding: utf-8 -*-
 import os
+import re
 import sys
 import time
-import random
+import platform
 import requests
-import re
-import subprocess
 
-from xvfbwrapper import Xvfb
-from DrissionPage import ChromiumPage, ChromiumOptions
-
-from cf_turnstile_helper import (
-    detect_cloudflare_challenge,
-    is_turnstile_present,
-    handle_turnstile,
-)
+from pyvirtualdisplay import Display
+from seleniumbase import SB
 
 
-# ==============================================================================
-# Telegram
-# ==============================================================================
-def send_tg_message(token, chat_id, message):
-    if not token or not chat_id:
-        print("未配置 TG_TOKEN 或 TG_CHAT_ID，跳过通知。")
+LOGIN_URL = "https://vps8.zz.cd/login"
+SIGNIN_URL = "https://vps8.zz.cd/points/signin"
+SS_DIR = "screenshots"
+
+
+def log(level, msg):
+    print(f"[{level}] {msg}")
+
+
+def send_tg_photo(token, chat_id, path, caption=""):
+    if not (token and chat_id and os.path.exists(path)):
         return
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": str(message), "parse_mode": "None"}
     try:
-        requests.post(url, json=payload, timeout=10)
-        print("✅ Telegram 通知发送成功")
-    except Exception as e:
-        print(f"❌ Telegram 通知失败: {e}")
-
-
-def send_tg_file(token, chat_id, file_path):
-    if not token or not chat_id:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendDocument"
-        with open(file_path, "rb") as f:
-            requests.post(url, data={"chat_id": chat_id}, files={"document": f}, timeout=20)
-        print(f"📎 已发送文件: {file_path}")
-    except Exception as e:
-        print(f"❌ 发送文件失败: {e}")
-
-
-def debug_dump(page, tg_token, tg_chat_id, name):
-    """保存截图 + HTML + 自动发送图片到 TG。"""
-    try:
-        html_file = f"{name}.html"
-        img_file = f"{name}.png"
-
-        with open(html_file, "w", encoding="utf-8") as f:
-            f.write(page.html or "")
-
-        page.get_screenshot(path=img_file, full_page=True)
-        print(f"🧪 调试文件已生成: {name}")
-
-        send_tg_file(tg_token, tg_chat_id, img_file)
-    except Exception as e:
-        print(f"❌ debug_dump 失败: {e}")
-
-
-# ==============================================================================
-# 输入辅助
-# ==============================================================================
-class HumanTyper:
-    @staticmethod
-    def type(ele, text):
-        ele.click()
-        try:
-            ele.clear()
-        except Exception:
-            pass
-        for c in str(text):
-            ele.input(c, clear=False)
-            time.sleep(random.uniform(0.05, 0.2))
-
-
-# ==============================================================================
-# Cloudflare Turnstile 适配
-# ==============================================================================
-class _TurnstileAdapter:
-    """把 DrissionPage page 适配成 cf_turnstile_helper 需要的 sb 接口。"""
-
-    def __init__(self, page):
-        self.page = page
-
-    def execute_script(self, script):
-        try:
-            return self.page.run_js(script, as_expr=True)
-        except TypeError:
-            return self.page.run_js(script)
-
-    def get_page_source(self):
-        return self.page.html or ""
-
-    def get_title(self):
-        try:
-            return self.page.title or ""
-        except Exception:
-            return ""
-
-
-def _activate_window():
-    for cls in ["chrome", "chromium", "Chromium", "Chrome", "google-chrome"]:
-        try:
-            r = subprocess.run(
-                ["xdotool", "search", "--onlyvisible", "--class", cls],
-                capture_output=True,
-                text=True,
-                timeout=3,
+        with open(path, "rb") as f:
+            requests.post(
+                f"https://api.telegram.org/bot{token}/sendPhoto",
+                files={"photo": f},
+                data={"chat_id": chat_id, "caption": caption},
+                timeout=30,
             )
-            wids = [w for w in r.stdout.strip().split("\n") if w.strip()]
-            if wids:
-                subprocess.run(
-                    ["xdotool", "windowactivate", "--sync", wids[0]],
-                    timeout=3,
-                    stderr=subprocess.DEVNULL,
-                )
-                time.sleep(0.2)
-                return
-        except Exception:
-            pass
+        log("INFO", "Telegram 截图发送成功")
+    except Exception as e:
+        log("ERROR", f"Telegram 截图发送失败: {e}")
 
 
-def _xdotool_click(x, y):
-    _activate_window()
+def screenshot(sb, name):
+    os.makedirs(SS_DIR, exist_ok=True)
+    path = os.path.join(SS_DIR, f"{name}.png")
     try:
-        subprocess.run(["xdotool", "mousemove", "--sync", str(int(x)), str(int(y))], timeout=3, stderr=subprocess.DEVNULL)
-        time.sleep(0.12)
-        subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
+        sb.save_screenshot(path)
+        log("INFO", f"截图: {name}")
+        return path
+    except Exception as e:
+        log("ERROR", f"截图失败 ({name}): {e}")
+        return ""
+
+
+def dump_html(sb, name):
+    os.makedirs(SS_DIR, exist_ok=True)
+    try:
+        with open(os.path.join(SS_DIR, f"{name}.html"), "w", encoding="utf-8") as f:
+            f.write(sb.get_page_source())
     except Exception:
         pass
 
 
-def _vps8_turnstile_container_click(page):
-    """VPS8 特化兜底：基于 .cf-turnstile 容器定位点击（适配 closed shadow root）。"""
-    try:
-        info = page.run_js(
-            """
-            (() => {
-                const host = document.querySelector('.cf-turnstile') || document.querySelector('[class*="turnstile"]');
-                if (!host) return null;
-                const r = host.getBoundingClientRect();
-                if (!r || r.width <= 0 || r.height <= 0) return null;
-                const sx = window.screenX || 0;
-                const sy = window.screenY || 0;
-                const bar = Math.max(0, (window.outerHeight || 0) - (window.innerHeight || 0));
-                return {
-                    viewportX: Math.round(r.left + Math.min(35, Math.max(18, r.width * 0.12))),
-                    viewportY: Math.round(r.top + r.height / 2),
-                    absX: Math.round(sx + r.left + Math.min(35, Math.max(18, r.width * 0.12))),
-                    absY: Math.round(sy + bar + r.top + r.height / 2),
-                    width: Math.round(r.width),
-                    height: Math.round(r.height),
-                };
-            })();
-            """,
-            as_expr=True,
-        )
-    except Exception:
-        info = None
-
-    if not info:
-        print("[cf][vps8-fallback] .cf-turnstile container not found")
-        try:
-            snap = page.run_js(
-                """
-                (() => {
-                    const cards = Array.from(document.querySelectorAll('form,div,section'))
-                        .filter(el => {
-                            const t = (el.innerText || '').toLowerCase();
-                            return t.includes('cloudflare') || t.includes('verify') || t.includes('human');
-                        })
-                        .slice(0, 8)
-                        .map(el => ({
-                            tag: el.tagName,
-                            cls: (el.className || '').toString().slice(0, 120),
-                            id: (el.id || '').toString().slice(0, 80),
-                            text: (el.innerText || '').replace(/\\s+/g, ' ').slice(0, 120),
-                        }));
-
-                    const allIframes = Array.from(document.querySelectorAll('iframe')).slice(0, 20).map(f => ({
-                        src: (f.src || '').slice(0, 180),
-                        id: (f.id || '').slice(0, 80),
-                        cls: (f.className || '').toString().slice(0, 120),
-                        w: Math.round((f.getBoundingClientRect() || {}).width || 0),
-                        h: Math.round((f.getBoundingClientRect() || {}).height || 0),
-                    }));
-
-                    const hidden = Array.from(document.querySelectorAll('input[type=\"hidden\"]')).filter(i => {
-                        const n = (i.name || '').toLowerCase();
-                        const id = (i.id || '').toLowerCase();
-                        return n.includes('turnstile') || n.includes('cf') || id.includes('turnstile') || id.includes('cf');
-                    }).slice(0, 12).map(i => ({
-                        name: (i.name || '').slice(0, 120),
-                        id: (i.id || '').slice(0, 120),
-                        vlen: ((i.value || '').length || 0),
-                    }));
-
-                    const turnstileClass = Array.from(document.querySelectorAll('[class*=\"turnstile\"], [id*=\"turnstile\"]'))
-                        .slice(0, 20).map(el => ({
-                            tag: el.tagName,
-                            cls: (el.className || '').toString().slice(0, 120),
-                            id: (el.id || '').toString().slice(0, 120),
-                            w: Math.round((el.getBoundingClientRect() || {}).width || 0),
-                            h: Math.round((el.getBoundingClientRect() || {}).height || 0),
-                        }));
-
-                    return { cards, allIframes, hidden, turnstileClass, title: document.title || '' };
-                })();
-                """,
-                as_expr=True,
-            )
-            print(f"[cf][vps8-fallback] dom snapshot: {snap}")
-        except Exception as e:
-            print(f"[cf][vps8-fallback] dom snapshot failed: {e}")
-        return False
-
-    print(f"[cf][vps8-fallback] click at ({info['absX']},{info['absY']}) size=({info['width']}x{info['height']})")
-    _xdotool_click(info["absX"], info["absY"])
-    return True
+def finish(sb, tg_token, tg_chat_id, name, caption):
+    dump_html(sb, name)
+    img = screenshot(sb, name)
+    if img:
+        send_tg_photo(tg_token, tg_chat_id, img, caption)
 
 
-def _vps8_turnstile_token_ready(page):
-    try:
-        return bool(
-            page.run_js(
-                """
-                (() => {
-                    const i = document.querySelector('input[name="cf-turnstile-response"]');
-                    return !!(i && i.value && i.value.length > 20);
-                })();
-                """,
-                as_expr=True,
-            )
-        )
-    except Exception:
-        return False
-
-
-def _vps8_turnstile_fallback(page, stage_name):
-    for attempt in range(6):
-        if _vps8_turnstile_token_ready(page):
-            print(f"[cf][vps8-fallback] solved before click (attempt {attempt + 1})")
-            return True
-
-        clicked = _vps8_turnstile_container_click(page)
-        if not clicked:
-            time.sleep(1.0)
-            continue
-
-        for _ in range(8):
-            time.sleep(0.5)
-            if _vps8_turnstile_token_ready(page):
-                print(f"[cf][vps8-fallback] solved after click (attempt {attempt + 1})")
-                return True
-
-        print(f"[cf][vps8-fallback] attempt {attempt + 1} failed")
-
-    print(f"[cf][vps8-fallback] {stage_name} failed after 6 attempts")
-    return False
-
-
-def _normalize_proxy_url(raw):
+def parse_account(raw):
     value = (raw or "").strip()
-    if not value:
-        return ""
-    if value.startswith(("http://", "https://", "socks5://", "socks5h://")):
-        return value
-    return f"http://{value}"
+    index = value.find(":")
+    if index <= 0 or index == len(value) - 1:
+        raise ValueError("vps8_ACCOUNTS 格式错误，应为 邮箱:密码")
+    return value[:index].strip(), value[index + 1 :].strip()
 
 
-def _build_requests_proxies(proxy_url=""):
-    px = (
-        proxy_url
-        or os.getenv("PROXY")
-        or os.getenv("ALL_PROXY")
-        or os.getenv("all_proxy")
-        or ""
-    )
-    px = _normalize_proxy_url(px)
-    if not px:
-        return None
-    return {"http": px, "https": px}
-
-
-def _probe_challenges_reachability(proxy_url=""):
-    test_url = "https://challenges.cloudflare.com/turnstile/v0/api.js"
-    proxies = _build_requests_proxies(proxy_url)
-    try:
-        r = requests.get(test_url, timeout=12, proxies=proxies, allow_redirects=True)
-        print(
-            f"[cf][net] api.js reachable status={r.status_code} bytes={len(r.text or '')} "
-            f"proxy={proxies['https'] if proxies else 'none'}"
-        )
-    except Exception as e:
-        print(f"[cf][net] api.js unreachable proxy={proxies['https'] if proxies else 'none'} err={e}")
-
-
-def _turnstile_dom_state(page):
-    try:
-        state = page.run_js(
-            """
-            (() => {
-                const tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
-                const token = tokenInput && tokenInput.value ? tokenInput.value : '';
-                const cfIframes = Array.from(document.querySelectorAll('iframe')).filter(f =>
-                    (f.src || '').includes('challenges.cloudflare.com')
-                );
-                const apiScripts = Array.from(document.querySelectorAll('script[src]')).filter(s =>
-                    (s.src || '').includes('challenges.cloudflare.com/turnstile/v0/api.js')
-                );
-                const hostA = document.querySelectorAll('.cf-turnstile').length;
-                const hostB = document.querySelectorAll('[class*="turnstile"],[id*="turnstile"]').length;
-                return {
-                    readyState: document.readyState || '',
-                    hostCount: hostA + hostB,
-                    hasHiddenInput: !!tokenInput,
-                    tokenLen: token.length,
-                    cfIframeCount: cfIframes.length,
-                    apiScriptCount: apiScripts.length,
-                };
-            })();
-            """,
-            as_expr=True,
-        )
-        return state or {}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def _wait_turnstile_observe(page, stage_name, proxy_url="", max_wait=60):
-    print(f"[cf][obs] {stage_name}: observing turnstile up to {max_wait}s")
-    _probe_challenges_reachability(proxy_url)
-
-    deadline = time.time() + max_wait
-    last_sig = ""
-    while time.time() < deadline:
-        st = _turnstile_dom_state(page)
-        sig = (
-            f"ready={st.get('readyState')} host={st.get('hostCount')} "
-            f"hidden={st.get('hasHiddenInput')} tokenLen={st.get('tokenLen')} "
-            f"cfIframe={st.get('cfIframeCount')} apiScript={st.get('apiScriptCount')}"
-        )
-        if sig != last_sig:
-            print(f"[cf][obs] {stage_name}: {sig}")
-            last_sig = sig
-
-        try:
-            token_len = int(st.get("tokenLen") or 0)
-        except Exception:
-            token_len = 0
-        if token_len > 20:
-            print(f"[cf][obs] {stage_name}: token already ready")
+def is_signed(html):
+    match = re.search(r"今日签到状态：\s*([^\n<]+)", html)
+    if match:
+        status = match.group(1).strip()
+        if status == "已签到":
             return True
+        if status == "未签到":
+            return False
 
-        try:
-            if int(st.get("cfIframeCount") or 0) > 0:
-                print(f"[cf][obs] {stage_name}: iframe rendered")
-                return True
-        except Exception:
-            pass
-
-        time.sleep(1)
-
-    print(f"[cf][obs] {stage_name}: observation timeout")
+    if "签到成功" in html and "今日签到状态" not in html:
+        return True
+    if "未签到" not in html and "当前连续签到" in html:
+        return True
     return False
 
 
-def solve_turnstile_if_needed(page, stage_name, tg_token, tg_chat_id, proxy_url=""):
-    sb = _TurnstileAdapter(page)
-
-    try:
-        detected = detect_cloudflare_challenge(sb) or is_turnstile_present(sb)
-    except Exception as e:
-        print(f"[cf] {stage_name}: 检测异常: {e}")
-        detected = False
-
-    if not detected:
-        print(f"[cf] {stage_name}: 未检测到 Turnstile，跳过")
-        return True
-
-    print(f"[cf] {stage_name}: 检测到 Turnstile，开始处理")
-    _wait_turnstile_observe(page, stage_name, proxy_url=proxy_url, max_wait=60)
-    ok = handle_turnstile(sb)
-    if not ok:
-        print(f"[cf] {stage_name}: 通用 helper 失败，尝试 VPS8 特化兜底")
-        ok = _vps8_turnstile_fallback(page, stage_name)
-    if ok:
-        print(f"[cf] {stage_name}: Turnstile 通过")
-        return True
-
-    msg = f"❌ {stage_name} Turnstile 验证失败"
-    send_tg_message(tg_token, tg_chat_id, msg)
-    debug_dump(page, tg_token, tg_chat_id, f"{stage_name}_turnstile_failed")
-    return False
-
-
-# ==============================================================================
-# 工具
-# ==============================================================================
 def extract_points(html):
-    text = html or ""
-    patterns = [
-        r"当前积分\s*[:：]?\s*<strong>(\d+)</strong>",
-        r"当前积分\s*[:：]?\s*(\d+)",
-        r"积分\s*[:：]?\s*(\d+)",
+    match = re.search(r"当前积分：\s*<strong>(\d+)</strong>", html)
+    return match.group(1) if match else "未知"
+
+
+def build_result_caption(account, result_text, before_points=None, current_points=None, fail_reason=None):
+    lines = [
+        "VPS8 每日签到",
+        f"🎮 账号：{account}",
+        f"📊 签到结果: {result_text}",
     ]
-    for p in patterns:
-        m = re.search(p, text, re.IGNORECASE)
-        if m:
-            return m.group(1)
-    return ""
+    if before_points is not None:
+        lines.append(f"🎉 签到前积分: {before_points}")
+    if current_points is not None:
+        lines.append(f"💰 当前积分: {current_points}")
+    if fail_reason:
+        lines.append(f"❌ 失败原因: {fail_reason}")
+    return "\n".join(lines)
 
 
-# ==============================================================================
-# 主逻辑
-# ==============================================================================
-def vps8_checkin(url, proxy_url=None):
-    tg_token = os.getenv("TG_TOKEN")
+def handle_turnstile(sb, scene="page", max_attempts=3):
+    log("INFO", f"[{scene}] 开始处理 Turnstile 验证")
+    sb.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    time.sleep(2)
+
+    for attempt in range(max_attempts):
+        log("INFO", f"[{scene}] Turnstile 尝试 {attempt + 1}/{max_attempts}")
+        try:
+            sb.uc_gui_click_captcha()
+            log("INFO", f"[{scene}] 已调用 uc_gui_click_captcha")
+        except Exception as e:
+            log("WARN", f"[{scene}] uc_gui_click_captcha 失败: {e}")
+
+        start = time.time()
+        while time.time() - start < 20:
+            token_ready = sb.execute_script(
+                """
+                var inp = document.querySelector('input[name="cf-turnstile-response"]');
+                return !!(inp && inp.value && inp.value.length > 20);
+                """
+            )
+            if token_ready:
+                log("INFO", f"[{scene}] ✅ Turnstile 通过")
+                screenshot(sb, f"turnstile_ok_{scene}")
+                return True
+
+            success = sb.execute_script(
+                """
+                var el = document.getElementById('success');
+                return el && getComputedStyle(el).display !== 'none';
+                """
+            )
+            if success:
+                log("INFO", f"[{scene}] Turnstile 显示成功元素")
+                return True
+            time.sleep(1)
+
+        log("WARN", f"[{scene}] 当前尝试超时，重试...")
+        sb.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(2)
+
+    log("ERROR", f"[{scene}] Turnstile 验证失败")
+    screenshot(sb, f"turnstile_fail_{scene}")
+    return False
+
+
+def login(sb, email, password):
+    log("INFO", "打开登录页")
+    sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=8)
+    time.sleep(5)
+    screenshot(sb, "01_login_loaded")
+
+    sb.wait_for_element_visible("#email", timeout=15)
+
+    if not handle_turnstile(sb, "login"):
+        return False, "登录验证失败"
+
+    log("INFO", f"填写邮箱: {email}")
+    sb.click("#email")
+    sb.clear("#email")
+    sb.type("#email", email)
+    time.sleep(0.5)
+
+    sb.click("#password")
+    sb.clear("#password")
+    sb.type("#password", password)
+    time.sleep(0.5)
+
+    screenshot(sb, "02_form_filled")
+
+    sb.wait_for_element_visible('button[type="submit"]', timeout=10)
+    sb.click('button[type="submit"]')
+    time.sleep(6)
+
+    if "login" in sb.get_current_url().lower():
+        log("ERROR", "登录失败，仍停留在登录页面")
+        return False, "登录失败"
+
+    log("INFO", "登录成功")
+    screenshot(sb, "03_login_success")
+    return True, None
+
+
+def do_signin(sb):
+    log("INFO", "打开签到页")
+    sb.uc_open_with_reconnect(SIGNIN_URL, reconnect_time=8)
+    time.sleep(5)
+    screenshot(sb, "04_signin_loaded")
+
+    sb.wait_for_element_visible("strong", timeout=10)
+
+    initial_html = sb.get_page_source()
+    before_points = extract_points(initial_html)
+    if is_signed(initial_html):
+        log("INFO", "今日已签到")
+        return True, "今日已签到", before_points, before_points, None
+
+    if not handle_turnstile(sb, "signin"):
+        return False, "签到失败", before_points, before_points, "签到验证失败"
+
+    btn = sb.find_element("#points-signin-submit", timeout=5)
+    if not btn:
+        log("ERROR", "找不到签到按钮")
+        return False, "签到失败", before_points, before_points, "找不到签到按钮"
+
+    btn.click()
+    log("INFO", "已点击签到")
+    time.sleep(3)
+
+    for i in range(10):
+        time.sleep(2)
+        html = sb.get_page_source()
+        if is_signed(html):
+            current_points = extract_points(html)
+            log("INFO", f"签到成功，积分: {current_points}")
+            return True, "签到成功", before_points, current_points, None
+        log("INFO", f"等待签到结果... ({i + 1})")
+
+    current_points = extract_points(sb.get_page_source())
+    log("WARN", "签到状态未确认")
+    return False, "签到失败", before_points, current_points, "未确认签到状态"
+
+
+def vps8_checkin():
+    tg_token = os.getenv("TG_BOT_TOKEN")
     tg_chat_id = os.getenv("TG_CHAT_ID")
-
-    vdisplay = Xvfb(width=1280, height=720)
-    vdisplay.start()
-
-    success = False
-    msg = ""
-    page = None
+    account_raw = os.getenv("vps8_ACCOUNTS")
+    proxy = (os.getenv("PROXY") or "").strip()
+    if not account_raw:
+        return False, "缺少 vps8_ACCOUNTS"
 
     try:
-        co = ChromiumOptions()
-        co.set_browser_path('/usr/bin/google-chrome')
-        co.set_argument('--no-sandbox')
-        co.set_argument('--disable-dev-shm-usage')
-        co.headless(False)
-
-        # 可选代理
-        if proxy_url:
-            try:
-                co.set_proxy(proxy_url)
-            except Exception:
-                co.set_argument('--proxy-server', proxy_url)
-
-        page = ChromiumPage(co)
-
-        print("🌐 打开页面")
-        page.get(url)
-        time.sleep(8)
-
-        # =========================
-        # 登录前 Turnstile
-        # =========================
-        if not solve_turnstile_if_needed(page, "login", tg_token, tg_chat_id, proxy_url=proxy_url):
-            return False, "❌ 登录前 Turnstile 验证失败"
-
-        # =========================
-        # 登录流程
-        # =========================
-        print("🔐 开始登录")
-        send_tg_message(tg_token, tg_chat_id, "🔐 VPS8 签到程序开始登录")
-
-        email = os.getenv("VPS8_USERNAME")
-        password = os.getenv("VPS8_PASSWORD")
-        if not email or not password:
-            return False, "❌ 未配置 VPS8_USERNAME / VPS8_PASSWORD"
-
-        email_input = page.ele('#email', timeout=6)
-        password_input = page.ele('#password', timeout=6)
-        if not email_input or not password_input:
-            debug_dump(page, tg_token, tg_chat_id, "login_input_missing")
-            return False, "❌ 找不到登录输入框"
-
-        HumanTyper.type(email_input, email)
-        HumanTyper.type(password_input, password)
-
-        btn = page.ele('xpath://button[@type="submit"]', timeout=6)
-        if not btn:
-            debug_dump(page, tg_token, tg_chat_id, "login_button_missing")
-            return False, "❌ 找不到登录按钮"
-
-        btn.click()
-        time.sleep(8)
-
-        if "login" not in (page.url or "").lower():
-            success = True
-            msg = "🎉 登录成功"
-            send_tg_message(tg_token, tg_chat_id, "🎉 VPS8 账号登录成功")
-        else:
-            debug_dump(page, tg_token, tg_chat_id, "login_failed")
-            return False, "❌ 登录失败"
-
-        # =========================
-        # 进入签到页
-        # =========================
-        print("➡️ 进入签到页面")
-        page.get("https://vps8.zz.cd/points/signin")
-        time.sleep(8)
-        send_tg_message(tg_token, tg_chat_id, "➡️ 进入签到处理页面")
-        debug_dump(page, tg_token, tg_chat_id, "signin_page")
-
-        # =========================
-        # 签到前 Turnstile
-        # =========================
-        if not solve_turnstile_if_needed(page, "signin", tg_token, tg_chat_id, proxy_url=proxy_url):
-            return False, "❌ 签到前 Turnstile 验证失败"
-
-        html_now = page.html or ""
-        if "已签到" in html_now:
-            points = extract_points(html_now)
-            msg = f"✅ 今天已签到，当前积分：{points or '未知'}"
-            send_tg_message(tg_token, tg_chat_id, msg)
-            debug_dump(page, tg_token, tg_chat_id, "already_signed")
-            return True, msg
-
-        print("🖱️ 点击签到按钮")
-        btn = page.ele('#points-signin-submit', timeout=6)
-        if not btn:
-            debug_dump(page, tg_token, tg_chat_id, "signin_button_missing")
-            return False, "❌ 找不到签到按钮"
-
-        try:
-            btn.click()
-        except Exception:
-            btn.click(by_js=True)
-
-        time.sleep(6)
-
-        html = page.html or ""
-        if "已签到" in html or "签到成功" in html:
-            points = extract_points(html)
-            msg = f"✅ 签到成功，当前积分：{points or '未知'}"
-            send_tg_message(tg_token, tg_chat_id, msg)
-            debug_dump(page, tg_token, tg_chat_id, "signin_success")
-            return True, msg
-
-        debug_dump(page, tg_token, tg_chat_id, "signin_unknown")
-        return True, "⚠️ 无法确认签到状态（请看截图）"
-
+        email, password = parse_account(account_raw)
     except Exception as e:
-        msg = f"🚨 异常: {str(e)[:200]}"
+        return False, str(e)
 
+    if proxy:
+        log("INFO", f"使用代理: {proxy}")
+    else:
+        log("INFO", "未设置代理(PROXY)，直连运行")
+
+    display = None
+    if platform.system().lower() == "linux" and not os.environ.get("DISPLAY"):
+        try:
+            display = Display(visible=False, size=(1280, 720))
+            display.start()
+            log("INFO", "虚拟显示已启动")
+        except Exception as e:
+            return False, f"虚拟显示失败: {e}"
+
+    try:
+        sb_kwargs = dict(uc=True, test=True, locale="zh-CN", headless2=False)
+        if proxy:
+            sb_kwargs["proxy"] = proxy
+
+        with SB(**sb_kwargs) as sb:
+            ok, reason = login(sb, email, password)
+            if not ok:
+                finish(
+                    sb,
+                    tg_token,
+                    tg_chat_id,
+                    "login_failed",
+                    build_result_caption(email, "签到失败", fail_reason=reason),
+                )
+                return False, reason
+
+            success, result_text, before_points, current_points, fail_reason = do_signin(sb)
+            finish(
+                sb,
+                tg_token,
+                tg_chat_id,
+                "signin_ok" if success else "signin_fail",
+                build_result_caption(email, result_text, before_points, current_points, fail_reason),
+            )
+            return success, result_text if success else fail_reason
+    except Exception as e:
+        log("ERROR", f"脚本异常: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return False, f"异常: {str(e)[:200]}"
     finally:
-        if page:
-            try:
-                page.quit()
-            except Exception:
-                pass
-        vdisplay.stop()
-
-    return success, msg
+        if display:
+            display.stop()
 
 
-# ==============================================================================
-# 入口
-# ==============================================================================
 if __name__ == "__main__":
-    url = os.getenv("RENEW_URL")
-    tg_token = os.getenv("TG_TOKEN")
-    tg_chat_id = os.getenv("TG_CHAT_ID")
-    proxy_url = os.getenv("ALL_PROXY") or os.getenv("all_proxy") or ""
-
-    if not url:
-        print("❌ 缺少 RENEW_URL")
-        sys.exit(1)
-
-    ok, msg = vps8_checkin(url, proxy_url=proxy_url)
-    send_tg_message(tg_token, tg_chat_id, msg)
-
+    ok, msg = vps8_checkin()
+    log("INFO", msg)
     if not ok:
         sys.exit(1)
