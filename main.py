@@ -265,7 +265,113 @@ def _vps8_turnstile_fallback(page, stage_name):
     return False
 
 
-def solve_turnstile_if_needed(page, stage_name, tg_token, tg_chat_id):
+def _normalize_proxy_url(raw):
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    if value.startswith(("http://", "https://", "socks5://", "socks5h://")):
+        return value
+    return f"http://{value}"
+
+
+def _build_requests_proxies(proxy_url=""):
+    px = (
+        proxy_url
+        or os.getenv("PROXY")
+        or os.getenv("ALL_PROXY")
+        or os.getenv("all_proxy")
+        or ""
+    )
+    px = _normalize_proxy_url(px)
+    if not px:
+        return None
+    return {"http": px, "https": px}
+
+
+def _probe_challenges_reachability(proxy_url=""):
+    test_url = "https://challenges.cloudflare.com/turnstile/v0/api.js"
+    proxies = _build_requests_proxies(proxy_url)
+    try:
+        r = requests.get(test_url, timeout=12, proxies=proxies, allow_redirects=True)
+        print(
+            f"[cf][net] api.js reachable status={r.status_code} bytes={len(r.text or '')} "
+            f"proxy={proxies['https'] if proxies else 'none'}"
+        )
+    except Exception as e:
+        print(f"[cf][net] api.js unreachable proxy={proxies['https'] if proxies else 'none'} err={e}")
+
+
+def _turnstile_dom_state(page):
+    try:
+        state = page.run_js(
+            """
+            (() => {
+                const tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
+                const token = tokenInput && tokenInput.value ? tokenInput.value : '';
+                const cfIframes = Array.from(document.querySelectorAll('iframe')).filter(f =>
+                    (f.src || '').includes('challenges.cloudflare.com')
+                );
+                const apiScripts = Array.from(document.querySelectorAll('script[src]')).filter(s =>
+                    (s.src || '').includes('challenges.cloudflare.com/turnstile/v0/api.js')
+                );
+                const hostA = document.querySelectorAll('.cf-turnstile').length;
+                const hostB = document.querySelectorAll('[class*="turnstile"],[id*="turnstile"]').length;
+                return {
+                    readyState: document.readyState || '',
+                    hostCount: hostA + hostB,
+                    hasHiddenInput: !!tokenInput,
+                    tokenLen: token.length,
+                    cfIframeCount: cfIframes.length,
+                    apiScriptCount: apiScripts.length,
+                };
+            })();
+            """,
+            as_expr=True,
+        )
+        return state or {}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _wait_turnstile_observe(page, stage_name, proxy_url="", max_wait=60):
+    print(f"[cf][obs] {stage_name}: observing turnstile up to {max_wait}s")
+    _probe_challenges_reachability(proxy_url)
+
+    deadline = time.time() + max_wait
+    last_sig = ""
+    while time.time() < deadline:
+        st = _turnstile_dom_state(page)
+        sig = (
+            f"ready={st.get('readyState')} host={st.get('hostCount')} "
+            f"hidden={st.get('hasHiddenInput')} tokenLen={st.get('tokenLen')} "
+            f"cfIframe={st.get('cfIframeCount')} apiScript={st.get('apiScriptCount')}"
+        )
+        if sig != last_sig:
+            print(f"[cf][obs] {stage_name}: {sig}")
+            last_sig = sig
+
+        try:
+            token_len = int(st.get("tokenLen") or 0)
+        except Exception:
+            token_len = 0
+        if token_len > 20:
+            print(f"[cf][obs] {stage_name}: token already ready")
+            return True
+
+        try:
+            if int(st.get("cfIframeCount") or 0) > 0:
+                print(f"[cf][obs] {stage_name}: iframe rendered")
+                return True
+        except Exception:
+            pass
+
+        time.sleep(1)
+
+    print(f"[cf][obs] {stage_name}: observation timeout")
+    return False
+
+
+def solve_turnstile_if_needed(page, stage_name, tg_token, tg_chat_id, proxy_url=""):
     sb = _TurnstileAdapter(page)
 
     try:
@@ -279,6 +385,7 @@ def solve_turnstile_if_needed(page, stage_name, tg_token, tg_chat_id):
         return True
 
     print(f"[cf] {stage_name}: 检测到 Turnstile，开始处理")
+    _wait_turnstile_observe(page, stage_name, proxy_url=proxy_url, max_wait=60)
     ok = handle_turnstile(sb)
     if not ok:
         print(f"[cf] {stage_name}: 通用 helper 失败，尝试 VPS8 特化兜底")
@@ -347,7 +454,7 @@ def vps8_checkin(url, proxy_url=None):
         # =========================
         # 登录前 Turnstile
         # =========================
-        if not solve_turnstile_if_needed(page, "login", tg_token, tg_chat_id):
+        if not solve_turnstile_if_needed(page, "login", tg_token, tg_chat_id, proxy_url=proxy_url):
             return False, "❌ 登录前 Turnstile 验证失败"
 
         # =========================
@@ -398,7 +505,7 @@ def vps8_checkin(url, proxy_url=None):
         # =========================
         # 签到前 Turnstile
         # =========================
-        if not solve_turnstile_if_needed(page, "signin", tg_token, tg_chat_id):
+        if not solve_turnstile_if_needed(page, "signin", tg_token, tg_chat_id, proxy_url=proxy_url):
             return False, "❌ 签到前 Turnstile 验证失败"
 
         html_now = page.html or ""
