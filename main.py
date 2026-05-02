@@ -89,7 +89,10 @@ class _TurnstileAdapter:
         self.page = page
 
     def execute_script(self, script):
-        return self.page.run_js(script)
+        try:
+            return self.page.run_js(script, as_expr=True)
+        except TypeError:
+            return self.page.run_js(script)
 
     def get_page_source(self):
         return self.page.html or ""
@@ -155,7 +158,8 @@ def _vps8_turnstile_container_click(page):
                     height: Math.round(r.height),
                 };
             })();
-            """
+            """,
+            as_expr=True,
         )
     except Exception:
         info = None
@@ -208,7 +212,8 @@ def _vps8_turnstile_container_click(page):
 
                     return { cards, allIframes, hidden, turnstileClass, title: document.title || '' };
                 })();
-                """
+                """,
+                as_expr=True,
             )
             print(f"[cf][vps8-fallback] dom snapshot: {snap}")
         except Exception as e:
@@ -229,7 +234,8 @@ def _vps8_turnstile_token_ready(page):
                     const i = document.querySelector('input[name="cf-turnstile-response"]');
                     return !!(i && i.value && i.value.length > 20);
                 })();
-                """
+                """,
+                as_expr=True,
             )
         )
     except Exception:
