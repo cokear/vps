@@ -3,16 +3,17 @@ import re
 import sys
 import time
 import platform
+import traceback
 import requests
 
 from pyvirtualdisplay import Display
 from seleniumbase import SB
 
 
-LOGIN_URL = "https://vps8.zz.cd/login"
-SIGNIN_URL = "https://vps8.zz.cd/points/signin"
-SS_DIR = "screenshots"
-IP_CHECK_URL = "https://api.ipify.org?format=json"
+LOGIN_URL = os.getenv("LOGIN_URL", "https://vps8.zz.cd/login")
+SIGNIN_URL = os.getenv("SIGNIN_URL", "https://vps8.zz.cd/points/signin")
+SS_DIR = os.getenv("SS_DIR", "screenshots")
+IP_CHECK_URL = os.getenv("IP_CHECK_URL", "https://api.ipify.org?format=json")
 
 
 def log(level, msg):
@@ -28,30 +29,33 @@ def mask_ip(ip):
         parts = value.split(":")
         if len(parts) >= 2:
             return ":".join(parts[:-2] + ["*", "*"])
-        if len(parts) == 1:
-            return "*:*"
-        return value
+        return "*:*"
 
     parts = value.split(".")
     if len(parts) == 4:
         return f"{parts[0]}.{parts[1]}.*.*"
-    if len(value) >= 2:
-        return value[:-2] + "**"
-    return "**"
+    return value[:-2] + "**" if len(value) >= 2 else "**"
+
+
+def mask_proxy(proxy):
+    p = (proxy or "").strip()
+    if not p:
+        return "<none>"
+    m = re.match(r"^([a-zA-Z0-9+.-]+://)([^@]+)@(.+)$", p)
+    if m:
+        return f"{m.group(1)}***@{m.group(3)}"
+    return p
 
 
 def detect_exit_ip(proxy=None):
-    proxies = None
-    if proxy:
-        proxies = {"http": proxy, "https": proxy}
+    proxies = {"http": proxy, "https": proxy} if proxy else None
     try:
-        resp = requests.get(IP_CHECK_URL, proxies=proxies, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        raw_ip = str(data.get("ip", "")).strip()
-        if not raw_ip:
+        r = requests.get(IP_CHECK_URL, proxies=proxies, timeout=20)
+        r.raise_for_status()
+        ip = str(r.json().get("ip", "")).strip()
+        if not ip:
             return False, "empty ip"
-        return True, raw_ip
+        return True, ip
     except Exception as e:
         return False, str(e)
 
@@ -101,11 +105,29 @@ def finish(sb, tg_token, tg_chat_id, name, caption):
 
 
 def parse_account(raw):
-    value = (raw or "").strip()
+    value = (raw or "").strip().replace("：", ":")
     index = value.find(":")
     if index <= 0 or index == len(value) - 1:
         raise ValueError("vps8_ACCOUNTS 格式错误，应为 邮箱:密码")
     return value[:index].strip(), value[index + 1 :].strip()
+
+
+def get_account_from_env():
+    raw = (
+        os.getenv("vps8_ACCOUNTS")
+        or os.getenv("VPS8_ACCOUNTS")
+        or ""
+    ).strip()
+
+    if raw:
+        return parse_account(raw)
+
+    username = (os.getenv("VPS8_USERNAME") or "").strip()
+    password = (os.getenv("VPS8_PASSWORD") or "").strip()
+    if username and password:
+        return username, password
+
+    raise ValueError("缺少账号信息：请设置 vps8_ACCOUNTS 或 VPS8_USERNAME/VPS8_PASSWORD")
 
 
 def is_signed(html):
@@ -116,6 +138,7 @@ def is_signed(html):
             return True
         if status == "未签到":
             return False
+
     if "签到成功" in html and "今日签到状态" not in html:
         return True
     if "未签到" not in html and "当前连续签到" in html:
@@ -147,6 +170,7 @@ def handle_turnstile(sb, scene="page", max_attempts=3):
     log("INFO", f"[{scene}] 开始处理 Turnstile 验证")
     sb.execute_script("window.scrollTo(0, document.body.scrollHeight);")
     time.sleep(2)
+
     for attempt in range(max_attempts):
         log("INFO", f"[{scene}] Turnstile 尝试 {attempt + 1}/{max_attempts}")
         try:
@@ -167,19 +191,12 @@ def handle_turnstile(sb, scene="page", max_attempts=3):
                 log("INFO", f"[{scene}] Turnstile 通过")
                 screenshot(sb, f"turnstile_ok_{scene}")
                 return True
-            success = sb.execute_script(
-                """
-                var el = document.getElementById('success');
-                return el && getComputedStyle(el).display !== 'none';
-                """
-            )
-            if success:
-                log("INFO", f"[{scene}] Turnstile 显示成功元素")
-                return True
             time.sleep(1)
+
         log("WARN", f"[{scene}] 当前尝试超时，重试...")
         sb.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(2)
+
     log("ERROR", f"[{scene}] Turnstile 验证失败")
     screenshot(sb, f"turnstile_fail_{scene}")
     return False
@@ -190,32 +207,24 @@ def login(sb, email, password):
     sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=8)
     time.sleep(5)
     screenshot(sb, "01_login_loaded")
+
     sb.wait_for_element_visible("#email", timeout=15)
 
     if not handle_turnstile(sb, "login"):
         return False, "登录验证失败"
 
-    log("INFO", f"填写邮箱: {email}")
-    sb.click("#email")
     sb.clear("#email")
     sb.type("#email", email)
-    time.sleep(0.5)
-
-    sb.click("#password")
     sb.clear("#password")
     sb.type("#password", password)
-    time.sleep(0.5)
     screenshot(sb, "02_form_filled")
 
-    sb.wait_for_element_visible('button[type="submit"]', timeout=10)
     sb.click('button[type="submit"]')
     time.sleep(6)
 
     if "login" in sb.get_current_url().lower():
-        log("ERROR", "登录失败，仍停留在登录页面")
-        return False, "登录失败"
+        return False, "登录失败，仍停留在登录页"
 
-    log("INFO", "登录成功")
     screenshot(sb, "03_login_success")
     return True, None
 
@@ -225,24 +234,19 @@ def do_signin(sb):
     sb.uc_open_with_reconnect(SIGNIN_URL, reconnect_time=8)
     time.sleep(5)
     screenshot(sb, "04_signin_loaded")
+
     sb.wait_for_element_visible("strong", timeout=10)
 
-    initial_html = sb.get_page_source()
-    before_points = extract_points(initial_html)
-    if is_signed(initial_html):
-        log("INFO", "今日已签到")
+    html = sb.get_page_source()
+    before_points = extract_points(html)
+    if is_signed(html):
         return True, "今日已签到", before_points, before_points, None
 
     if not handle_turnstile(sb, "signin"):
         return False, "签到失败", before_points, before_points, "签到验证失败"
 
-    btn = sb.find_element("#points-signin-submit", timeout=5)
-    if not btn:
-        log("ERROR", "找不到签到按钮")
-        return False, "签到失败", before_points, before_points, "找不到签到按钮"
-
-    btn.click()
-    log("INFO", "已点击签到")
+    sb.wait_for_element_visible("#points-signin-submit", timeout=10)
+    sb.click("#points-signin-submit")
     time.sleep(3)
 
     for i in range(10):
@@ -250,32 +254,24 @@ def do_signin(sb):
         html = sb.get_page_source()
         if is_signed(html):
             current_points = extract_points(html)
-            log("INFO", f"签到成功，积分: {current_points}")
             return True, "签到成功", before_points, current_points, None
         log("INFO", f"等待签到结果... ({i + 1})")
 
     current_points = extract_points(sb.get_page_source())
-    log("WARN", "签到状态未确认")
     return False, "签到失败", before_points, current_points, "未确认签到状态"
 
 
 def vps8_checkin():
-    tg_token = os.getenv("TG_BOT_TOKEN")
+    tg_token = os.getenv("TG_BOT_TOKEN") or os.getenv("TG_TOKEN")
     tg_chat_id = os.getenv("TG_CHAT_ID")
-    account_raw = os.getenv("vps8_ACCOUNTS")
     proxy = (os.getenv("PROXY") or "").strip()
-    if not account_raw:
-        return False, "缺少 vps8_ACCOUNTS"
 
     try:
-        email, password = parse_account(account_raw)
+        email, password = get_account_from_env()
     except Exception as e:
         return False, str(e)
 
-    if proxy:
-        log("INFO", f"使用代理: {proxy}")
-    else:
-        log("INFO", "未设置代理(PROXY)，直连运行")
+    log("INFO", f"代理: {mask_proxy(proxy)}")
 
     ok_ip, ip_or_err = detect_exit_ip(proxy=proxy or None)
     if ok_ip:
@@ -300,13 +296,7 @@ def vps8_checkin():
         with SB(**sb_kwargs) as sb:
             ok, reason = login(sb, email, password)
             if not ok:
-                finish(
-                    sb,
-                    tg_token,
-                    tg_chat_id,
-                    "login_failed",
-                    build_result_caption(email, "签到失败", fail_reason=reason),
-                )
+                finish(sb, tg_token, tg_chat_id, "login_failed", build_result_caption(email, "签到失败", fail_reason=reason))
                 return False, reason
 
             success, result_text, before_points, current_points, fail_reason = do_signin(sb)
@@ -319,9 +309,6 @@ def vps8_checkin():
             )
             return success, result_text if success else fail_reason
     except Exception as e:
-        log("ERROR", f"脚本异常: {e}")
-        import traceback
-
         traceback.print_exc()
         return False, f"异常: {str(e)[:200]}"
     finally:
