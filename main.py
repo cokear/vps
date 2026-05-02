@@ -14,6 +14,11 @@ LOGIN_URL = os.getenv("LOGIN_URL", "https://vps8.zz.cd/login")
 SIGNIN_URL = os.getenv("SIGNIN_URL", "https://vps8.zz.cd/points/signin")
 SS_DIR = os.getenv("SS_DIR", "screenshots")
 IP_CHECK_URL = os.getenv("IP_CHECK_URL", "https://api.ipify.org?format=json")
+BROWSER_IP_PROBE_URLS = [
+    "https://api.ipify.org",
+    "https://ifconfig.me/ip",
+    "https://icanhazip.com",
+]
 
 
 def log(level, msg):
@@ -45,6 +50,21 @@ def mask_proxy(proxy):
     if m:
         return f"{m.group(1)}***"
     return "***"
+
+
+def extract_ip_from_text(text):
+    if not text:
+        return ""
+
+    m4 = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text)
+    if m4:
+        return m4.group(0)
+
+    m6 = re.search(r"\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b", text)
+    if m6:
+        return m6.group(0)
+
+    return ""
 
 
 def detect_exit_ip(proxy=None):
@@ -125,21 +145,16 @@ def parse_account(raw):
     idx = value.find(":")
     if idx <= 0 or idx == len(value) - 1:
         raise ValueError("vps8_ACCOUNTS 格式错误，应为 邮箱:密码")
-    return value[:idx].strip(), value[idx + 1 :].strip()
+    return value[:idx].strip(), value[idx + 1:].strip()
 
 
 def get_account_from_env():
-    # 兼容两种账户传法
-    by_pair_user = (os.getenv("VPS8_USERNAME") or "").strip()
-    by_pair_pass = (os.getenv("VPS8_PASSWORD") or "").strip()
-    if by_pair_user and by_pair_pass:
-        return by_pair_user, by_pair_pass
+    user = (os.getenv("VPS8_USERNAME") or "").strip()
+    pwd = (os.getenv("VPS8_PASSWORD") or "").strip()
+    if user and pwd:
+        return user, pwd
 
-    raw = (
-        os.getenv("vps8_ACCOUNTS")
-        or os.getenv("VPS8_ACCOUNTS")
-        or ""
-    ).strip()
+    raw = (os.getenv("vps8_ACCOUNTS") or os.getenv("VPS8_ACCOUNTS") or "").strip()
     if raw:
         return parse_account(raw)
 
@@ -154,6 +169,7 @@ def is_signed(html):
             return True
         if status == "未签到":
             return False
+
     if "签到成功" in html and "今日签到状态" not in html:
         return True
     if "未签到" not in html and "当前连续签到" in html:
@@ -194,8 +210,63 @@ def wait_any_visible(sb, selectors, timeout=15):
     return None
 
 
+def get_page_blob(sb):
+    body_text = ""
+    html = ""
+    try:
+        if sb.is_element_present("body"):
+            body_text = sb.get_text("body") or ""
+    except Exception:
+        pass
+    try:
+        html = sb.get_page_source() or ""
+    except Exception:
+        pass
+    return f"{body_text}\n{html}"
+
+
+def detect_chrome_error(blob):
+    checks = [
+        ("ERR_EMPTY_RESPONSE", "ERR_EMPTY_RESPONSE"),
+        ("ERR_TUNNEL_CONNECTION_FAILED", "ERR_TUNNEL_CONNECTION_FAILED"),
+        ("ERR_PROXY_CONNECTION_FAILED", "ERR_PROXY_CONNECTION_FAILED"),
+        ("This page isn", "Chrome 错误页"),
+        ("didn't send any data", "目标站无响应"),
+    ]
+    for key, msg in checks:
+        if key in blob:
+            return msg
+    return ""
+
+
+def detect_browser_exit_ip(sb, timeout=20):
+    last_err = "unknown"
+
+    for url in BROWSER_IP_PROBE_URLS:
+        try:
+            sb.open(url)
+            end = time.time() + timeout
+
+            while time.time() < end:
+                blob = get_page_blob(sb)
+                err = detect_chrome_error(blob)
+                if err:
+                    return False, f"{url} -> {err}"
+
+                ip = extract_ip_from_text(blob)
+                if ip:
+                    return True, ip
+
+                time.sleep(1)
+
+            last_err = f"{url} -> timeout/no ip"
+        except Exception as e:
+            last_err = f"{url} -> {e}"
+
+    return False, last_err
+
+
 def handle_turnstile(sb, scene="page", max_attempts=3):
-    # 没有 Turnstile 容器就不做处理（有些时候站点不要求）
     try:
         has_ts = sb.execute_script(
             "return !!document.querySelector('.cf-turnstile, iframe[src*=\"turnstile\"], input[name=\"cf-turnstile-response\"]');"
@@ -258,13 +329,20 @@ def login(sb, email, password):
         timeout=15,
     )
     if not email_selector:
+        blob = get_page_blob(sb)
+        net_err = detect_chrome_error(blob)
+
         screenshot(sb, "01_login_no_email")
         dump_html(sb, "01_login_no_email")
+
         cur = "<unknown>"
         try:
             cur = sb.get_current_url()
         except Exception:
             pass
+
+        if net_err:
+            return False, f"登录页网络异常: {net_err}，当前URL: {cur}"
         return False, f"登录页未出现邮箱输入框，当前URL: {cur}"
 
     if not handle_turnstile(sb, "login"):
@@ -346,11 +424,11 @@ def vps8_checkin():
 
     log("INFO", f"代理: {mask_proxy(proxy)}")
 
-    ok_ip, ip_or_err = detect_exit_ip(proxy=proxy or None)
-    if ok_ip:
-        log("INFO", f"出口IP(脱敏): {mask_ip(ip_or_err)}")
+    ok_req_ip, req_ip_or_err = detect_exit_ip(proxy=proxy or None)
+    if ok_req_ip:
+        log("INFO", f"请求出口IP(脱敏): {mask_ip(req_ip_or_err)}")
     else:
-        log("WARN", f"出口IP检测失败: {ip_or_err}")
+        log("WARN", f"请求出口IP检测失败: {req_ip_or_err}")
 
     display = None
     if platform.system().lower() == "linux" and not os.environ.get("DISPLAY"):
@@ -369,6 +447,16 @@ def vps8_checkin():
             sb_kwargs["proxy"] = proxy
 
         with SB(**sb_kwargs) as sb:
+            ok_bip, bip_or_err = detect_browser_exit_ip(sb, timeout=20)
+            if ok_bip:
+                log("INFO", f"浏览器出口IP(脱敏): {mask_ip(bip_or_err)}")
+            else:
+                screenshot(sb, "00_browser_ip_failed")
+                dump_html(sb, "00_browser_ip_failed")
+                reason = f"浏览器出口IP检测失败: {bip_or_err}"
+                send_tg_text(tg_token, tg_chat_id, f"VPS8 签到失败: {reason}")
+                return False, reason
+
             ok, reason = login(sb, email, password)
             if not ok:
                 finish(
