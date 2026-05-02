@@ -162,6 +162,57 @@ def _vps8_turnstile_container_click(page):
 
     if not info:
         print("[cf][vps8-fallback] .cf-turnstile container not found")
+        try:
+            snap = page.run_js(
+                """
+                (() => {
+                    const cards = Array.from(document.querySelectorAll('form,div,section'))
+                        .filter(el => {
+                            const t = (el.innerText || '').toLowerCase();
+                            return t.includes('cloudflare') || t.includes('verify') || t.includes('human');
+                        })
+                        .slice(0, 8)
+                        .map(el => ({
+                            tag: el.tagName,
+                            cls: (el.className || '').toString().slice(0, 120),
+                            id: (el.id || '').toString().slice(0, 80),
+                            text: (el.innerText || '').replace(/\\s+/g, ' ').slice(0, 120),
+                        }));
+
+                    const allIframes = Array.from(document.querySelectorAll('iframe')).slice(0, 20).map(f => ({
+                        src: (f.src || '').slice(0, 180),
+                        id: (f.id || '').slice(0, 80),
+                        cls: (f.className || '').toString().slice(0, 120),
+                        w: Math.round((f.getBoundingClientRect() || {}).width || 0),
+                        h: Math.round((f.getBoundingClientRect() || {}).height || 0),
+                    }));
+
+                    const hidden = Array.from(document.querySelectorAll('input[type=\"hidden\"]')).filter(i => {
+                        const n = (i.name || '').toLowerCase();
+                        const id = (i.id || '').toLowerCase();
+                        return n.includes('turnstile') || n.includes('cf') || id.includes('turnstile') || id.includes('cf');
+                    }).slice(0, 12).map(i => ({
+                        name: (i.name || '').slice(0, 120),
+                        id: (i.id || '').slice(0, 120),
+                        vlen: ((i.value || '').length || 0),
+                    }));
+
+                    const turnstileClass = Array.from(document.querySelectorAll('[class*=\"turnstile\"], [id*=\"turnstile\"]'))
+                        .slice(0, 20).map(el => ({
+                            tag: el.tagName,
+                            cls: (el.className || '').toString().slice(0, 120),
+                            id: (el.id || '').toString().slice(0, 120),
+                            w: Math.round((el.getBoundingClientRect() || {}).width || 0),
+                            h: Math.round((el.getBoundingClientRect() || {}).height || 0),
+                        }));
+
+                    return { cards, allIframes, hidden, turnstileClass, title: document.title || '' };
+                })();
+                """
+            )
+            print(f"[cf][vps8-fallback] dom snapshot: {snap}")
+        except Exception as e:
+            print(f"[cf][vps8-fallback] dom snapshot failed: {e}")
         return False
 
     print(f"[cf][vps8-fallback] click at ({info['absX']},{info['absY']}) size=({info['width']}x{info['height']})")
