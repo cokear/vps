@@ -39,7 +39,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install seleniumbase pyvirtualdisplay "requests[socks]" DrissionPage xvfbwrapper SpeechRecognition pydub
 
-      - name: Start gost relay
+      - name: Start gost relay (SOCKS5 -> HTTP)
         env:
           VPS8_PROXY: ${{ secrets.VPS8_PROXY }}
         run: |
@@ -47,15 +47,22 @@ jobs:
 
           docker pull ginuerzh/gost
           docker rm -f gost-relay || true
-          docker run -d --name gost-relay --network host \
-            ginuerzh/gost -L=socks5://127.0.0.1:1080 -F="${VPS8_PROXY}"
+          docker run -d --name gost-relay -p 127.0.0.1:8080:8080 \
+            ginuerzh/gost \
+            -L=http://:8080 \
+            -F="${VPS8_PROXY}"
 
           sleep 3
           docker ps --filter "name=gost-relay"
           docker logs --tail 50 gost-relay || true
 
-          # 检测 gost 出口
-          curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org -m 20
+      - name: Probe proxy chain
+        run: |
+          echo "== ip via gost http =="
+          curl -x http://127.0.0.1:8080 https://api.ipify.org --max-time 25
+          echo
+          echo "== target via gost http =="
+          curl -x http://127.0.0.1:8080 -I https://vps8.zz.cd/login -v --max-time 25
 
       - name: Run Script
         env:
@@ -64,14 +71,14 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          PROXY: socks5h://127.0.0.1:1080
+          PROXY: http://127.0.0.1:8080
         run: |
           [ -n "${VPS8_USERNAME:-}" ] || (echo "VPS8_USERNAME empty" && exit 1)
           [ -n "${VPS8_PASSWORD:-}" ] || (echo "VPS8_PASSWORD empty" && exit 1)
 
-          # 兼容你脚本可能读取的变量名
-          export vps8_ACCOUNTS="${VPS8_USERNAME}:${VPS8_PASSWORD}"
+          # 兼容脚本读取的变量名
           export VPS8_ACCOUNTS="${VPS8_USERNAME}:${VPS8_PASSWORD}"
+          export vps8_ACCOUNTS="${VPS8_USERNAME}:${VPS8_PASSWORD}"
 
           python main.py
 
