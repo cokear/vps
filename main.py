@@ -5,6 +5,7 @@ import time
 import random
 import requests
 import re
+import subprocess
 
 from xvfbwrapper import Xvfb
 from DrissionPage import ChromiumPage, ChromiumOptions
@@ -100,6 +101,113 @@ class _TurnstileAdapter:
             return ""
 
 
+def _activate_window():
+    for cls in ["chrome", "chromium", "Chromium", "Chrome", "google-chrome"]:
+        try:
+            r = subprocess.run(
+                ["xdotool", "search", "--onlyvisible", "--class", cls],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            wids = [w for w in r.stdout.strip().split("\n") if w.strip()]
+            if wids:
+                subprocess.run(
+                    ["xdotool", "windowactivate", "--sync", wids[0]],
+                    timeout=3,
+                    stderr=subprocess.DEVNULL,
+                )
+                time.sleep(0.2)
+                return
+        except Exception:
+            pass
+
+
+def _xdotool_click(x, y):
+    _activate_window()
+    try:
+        subprocess.run(["xdotool", "mousemove", "--sync", str(int(x)), str(int(y))], timeout=3, stderr=subprocess.DEVNULL)
+        time.sleep(0.12)
+        subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def _vps8_turnstile_container_click(page):
+    """VPS8 特化兜底：基于 .cf-turnstile 容器定位点击（适配 closed shadow root）。"""
+    try:
+        info = page.run_js(
+            """
+            (() => {
+                const host = document.querySelector('.cf-turnstile') || document.querySelector('[class*="turnstile"]');
+                if (!host) return null;
+                const r = host.getBoundingClientRect();
+                if (!r || r.width <= 0 || r.height <= 0) return null;
+                const sx = window.screenX || 0;
+                const sy = window.screenY || 0;
+                const bar = Math.max(0, (window.outerHeight || 0) - (window.innerHeight || 0));
+                return {
+                    viewportX: Math.round(r.left + Math.min(35, Math.max(18, r.width * 0.12))),
+                    viewportY: Math.round(r.top + r.height / 2),
+                    absX: Math.round(sx + r.left + Math.min(35, Math.max(18, r.width * 0.12))),
+                    absY: Math.round(sy + bar + r.top + r.height / 2),
+                    width: Math.round(r.width),
+                    height: Math.round(r.height),
+                };
+            })();
+            """
+        )
+    except Exception:
+        info = None
+
+    if not info:
+        print("[cf][vps8-fallback] .cf-turnstile container not found")
+        return False
+
+    print(f"[cf][vps8-fallback] click at ({info['absX']},{info['absY']}) size=({info['width']}x{info['height']})")
+    _xdotool_click(info["absX"], info["absY"])
+    return True
+
+
+def _vps8_turnstile_token_ready(page):
+    try:
+        return bool(
+            page.run_js(
+                """
+                (() => {
+                    const i = document.querySelector('input[name="cf-turnstile-response"]');
+                    return !!(i && i.value && i.value.length > 20);
+                })();
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def _vps8_turnstile_fallback(page, stage_name):
+    for attempt in range(6):
+        if _vps8_turnstile_token_ready(page):
+            print(f"[cf][vps8-fallback] solved before click (attempt {attempt + 1})")
+            return True
+
+        clicked = _vps8_turnstile_container_click(page)
+        if not clicked:
+            time.sleep(1.0)
+            continue
+
+        for _ in range(8):
+            time.sleep(0.5)
+            if _vps8_turnstile_token_ready(page):
+                print(f"[cf][vps8-fallback] solved after click (attempt {attempt + 1})")
+                return True
+
+        print(f"[cf][vps8-fallback] attempt {attempt + 1} failed")
+
+    print(f"[cf][vps8-fallback] {stage_name} failed after 6 attempts")
+    return False
+
+
 def solve_turnstile_if_needed(page, stage_name, tg_token, tg_chat_id):
     sb = _TurnstileAdapter(page)
 
@@ -115,6 +223,9 @@ def solve_turnstile_if_needed(page, stage_name, tg_token, tg_chat_id):
 
     print(f"[cf] {stage_name}: 检测到 Turnstile，开始处理")
     ok = handle_turnstile(sb)
+    if not ok:
+        print(f"[cf] {stage_name}: 通用 helper 失败，尝试 VPS8 特化兜底")
+        ok = _vps8_turnstile_fallback(page, stage_name)
     if ok:
         print(f"[cf] {stage_name}: Turnstile 通过")
         return True
