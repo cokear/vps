@@ -1,0 +1,82 @@
+name: Ulzix Auto Checkin
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "0 0,8,16 * * *"
+
+jobs:
+  run:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup DNS
+        run: |
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" | sudo tee /etc/resolv.conf
+          sudo chattr +i /etc/resolv.conf 2>/dev/null || true
+
+      - name: Install gost and start local proxy
+        env:
+          PROXY_UPSTREAM: ${{ secrets.PROXY_UPSTREAM }}
+        run: |
+          if [ -z "$PROXY_UPSTREAM" ]; then
+            echo "::warning::未配置 PROXY_UPSTREAM，跳过 gost，脚本将直连"
+            exit 0
+          fi
+
+          echo "[gost] 下载 gost v2.11.5"
+          wget -q https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz
+          gunzip gost-linux-amd64-2.11.5.gz
+          chmod +x gost-linux-amd64-2.11.5
+          sudo mv gost-linux-amd64-2.11.5 /usr/local/bin/gost
+          gost -V || true
+
+          echo "[gost] 启动本地转发: 127.0.0.1:8080 -> 上游代理"
+          nohup gost -L=http://127.0.0.1:8080 -F="$PROXY_UPSTREAM" > gost.log 2>&1 &
+
+          echo "[gost] 等待本地端口就绪..."
+          for i in {1..15}; do
+            if curl -s --max-time 5 -x http://127.0.0.1:8080 https://api.ipify.org >/dev/null; then
+              echo "[gost] 本地代理已就绪"
+              break
+            fi
+            echo "[gost] 等待中... ($i/15)"
+            sleep 2
+          done
+
+          echo -n "[gost] 经代理出口 IP: "
+          curl -s --max-time 10 -x http://127.0.0.1:8080 https://api.ipify.org && echo
+          curl -s --max-time 10 -x http://127.0.0.1:8080 https://ipinfo.io && echo
+          echo "----- gost.log -----"
+          cat gost.log || true
+
+      - name: Setup environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          NEEDRESTART_MODE: a
+        run: |
+          echo "[setup] apt update"
+          sudo -E apt-get update
+          echo "[setup] apt install"
+          sudo -E apt-get install -y -o Dpkg::Use-Pty=0 xvfb python3 python3-pip python3-tk python3-dev google-chrome-stable fontconfig fonts-noto-cjk fonts-wqy-zenhei fonts-wqy-microhei
+          echo "[setup] pip install python deps"
+          python3 -m pip install --upgrade pip
+          python3 -m pip install seleniumbase pyvirtualdisplay requests
+          echo "[setup] rebuild font cache"
+          fc-cache -fv
+
+      - name: Run python checkin flow
+        env:
+          ACCOUNTS: ${{ secrets.ACCOUNTS }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # 浏览器对接本地 gost 端口；未配置 PROXY_UPSTREAM 时设为空可改直连
+          BROWSER_PROXY: ${{ secrets.PROXY_UPSTREAM != '' && '127.0.0.1:8080' || '' }}
+        run: |
+          python3 checkin.py
