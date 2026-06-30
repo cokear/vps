@@ -1,10 +1,9 @@
 name: Ulzix Auto Checkin
 
 on:
+  repository_dispatch:
+    types: [ulzix]
   workflow_dispatch:
-
-  schedule:
-    - cron: "0 0,8,16 * * *"
 
 jobs:
   run:
