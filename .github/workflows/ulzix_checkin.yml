@@ -87,4 +87,4 @@ jobs:
           # 浏览器对接本地 gost 端口；未配置 PROXY_UPSTREAM 时设为空可改直连
           BROWSER_PROXY: ${{ secrets.PROXY_UPSTREAM != '' && '127.0.0.1:8080' || '' }}
         run: |
-          python3 checkin.py
+          python3 ulzix_checkin.py
