@@ -13,13 +13,7 @@ LOGIN_URL = "https://idc-new.ulzix.com/login"
 SIGNIN_URL = "https://idc-new.ulzix.com/pointmall/signin"
 SS_DIR = "screenshots"
 
-# ================= 代理配置 =================
-# 通过 gost 把上游(带认证的 socks5/http)转发成本地无认证 HTTP，
-# 浏览器只对接本地端口，避免 uc 模式的代理认证弹窗问题。
-# 例如: gost -L http://127.0.0.1:8080 -F "socks5://user:pass@上游IP:1080"
-# 留空则不使用代理。
 PROXY_URL = os.getenv("BROWSER_PROXY", "127.0.0.1:8080")
-# ===========================================
 
 
 def log(level, msg):
@@ -29,7 +23,6 @@ def log(level, msg):
 def send_tg_photo(token, chat_id, path, caption=""):
     if not (token and chat_id and os.path.exists(path)):
         return
-
     try:
         with open(path, "rb") as f:
             requests.post(
@@ -72,7 +65,6 @@ def finish(sb, tg_token, tg_chat_id, name, caption):
 
 
 def mask_email(email):
-    # 仅用于日志显示，对邮箱本地部分打码: nola@outlook.com -> n**a@outlook.com
     try:
         local, domain = (email or "").split("@", 1)
         if len(local) <= 2:
@@ -89,30 +81,20 @@ def parse_account(raw):
     index = value.find(":")
     if index <= 0 or index == len(value) - 1:
         raise ValueError("ACCOUNTS 格式错误，应为 邮箱:密码")
-    return value[:index].strip(), value[index + 1 :].strip()
+    return value[:index].strip(), value[index + 1:].strip()
 
 
 def is_signed(html):
-    # ✅ 1. 页面明确显示“今日已签到”
     if "今日已签到" in html:
         return True
-
-    # ✅ 2. 按钮已签到状态（你HTML里真实存在）
     if "btn btn-success" in html and "已签到" in html:
         return True
-
-    # ✅ 3. 禁用按钮（已签到特征）
     if "disabled" in html and "已签到" in html:
         return True
-
-    # ❌ 未签到按钮通常是可点击
     if "立即签到" in html or "btn-signin" in html:
         return False
-
-    # ✅ 4. fallback：积分区域存在但不关键
     if "签到记录" in html:
         return True
-
     return False
 
 
@@ -144,12 +126,10 @@ def handle_turnstile(sb, scene="page", max_attempts=3):
     for attempt in range(max_attempts):
         log("INFO", f"[{scene}] Turnstile 尝试 {attempt + 1}/{max_attempts}")
         try:
-            #sb.uc_gui_click_captcha()
-            #log("INFO", f"[{scene}] 已调用 uc_gui_click_captcha")
             sb.uc_gui_handle_captcha()
             log("INFO", f"[{scene}] 已调用 uc_gui_handle_captcha")
         except Exception as e:
-            log("WARN", f"[{scene}] uc_gui_click_captcha 失败: {e}")
+            log("WARN", f"[{scene}] uc_gui_handle_captcha 失败: {e}")
 
         start = time.time()
         while time.time() - start < 20:
@@ -224,7 +204,8 @@ def do_signin(sb):
     time.sleep(5)
     screenshot(sb, "04_signin_loaded")
 
-    sb.wait_for_element_visible("strong", timeout=10)
+    # 只等 body 确认页面加载完成，不依赖具体标签
+    sb.wait_for_element_visible("body", timeout=10)
 
     initial_html = sb.get_page_source()
     before_points = extract_points(initial_html)
@@ -288,7 +269,7 @@ def Ulzix_checkin():
     try:
         with SB(
             uc=True,
-            test=True,
+            # test=True 已移除：失败时会触发 sys.exit() 导致函数返回 None
             locale="zh-CN",
             headless2=False,
             proxy=proxy if proxy else None,
@@ -316,12 +297,13 @@ def Ulzix_checkin():
     except Exception as e:
         log("ERROR", f"脚本异常: {e}")
         import traceback
-
         traceback.print_exc()
         return False, f"异常: {str(e)[:200]}"
     finally:
         if display:
             display.stop()
+
+    return False, "未知错误"  # 兜底，防止任何情况下返回 None
 
 
 if __name__ == "__main__":
