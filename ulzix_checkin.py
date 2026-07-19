@@ -1,232 +1,313 @@
-import time
 import os
-import json
 import re
-import random
+import sys
+import time
+import platform
 import requests
 
-# 智能环境配置：仅在未设置时才应用默认值
-# 这样兼容 GitHub Actions 的 xvfb-run (会自动设置 DISPLAY) 和 Docker 环境
-if "DISPLAY" not in os.environ:
-    os.environ["DISPLAY"] = ":1"
-    
-if "XAUTHORITY" not in os.environ:
-    # 仅当路径存在时才设置，避免在 GitHub Runner (home/runner) 中报错
-    if os.path.exists("/home/headless/.Xauthority"):
-        os.environ["XAUTHORITY"] = "/home/headless/.Xauthority"
-
-print(f"[DEBUG] Env DISPLAY: {os.environ.get('DISPLAY')}")
-print(f"[DEBUG] Env XAUTHORITY: {os.environ.get('XAUTHORITY')}")
-
+from pyvirtualdisplay import Display
 from seleniumbase import SB
 
-# ================= 配置区域 =================
-PROXY_URL = os.getenv("PROXY", "")  # 代理
-EMAIL = os.getenv("EMAIL")  # 邮箱
-PASSWORD = os.getenv("PASSWORD")  # 密码
-TG_TOKEN = os.getenv("TG_TOKEN")  # tg通知token
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")  # tg通知chat_id
 
-# 目标 URL
-LOGIN_PANEL = "https://idc-new.ulzix.com/login"
-CHECKIN_URL = "https://idc-new.ulzix.com/pointmall/signin"
-# ===========================================
-PROXY_URL = os.getenv("BROWSER_PROXY", "127.0.0.1:8080")
-class UlzixCheckin:
-    def __init__(self):
-        self.BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-        self.screenshot_dir = os.path.join(self.BASE_DIR, "artifacts")
-        if not os.path.exists(self.screenshot_dir):
-            os.makedirs(self.screenshot_dir)
+LOGIN_URL = "https://idc-new.ulzix.com/login"
+SIGNIN_URL = "https://idc-new.ulzix.com/pointmall/signin"
+SS_DIR = "screenshots"
 
-    def log(self, msg):
-        timestamp = time.strftime('%H:%M:%S')
-        print(f"[{timestamp}] [INFO] {msg}", flush=True)
+# 【修复 1】代理环境变量默认值改为为空，防止本地无代理时强制连 8080 导致死锁崩溃
+PROXY_URL = os.getenv("BROWSER_PROXY", "")
 
-    def human_wait(self, min_s=6, max_s=10):
-        """随机模拟人类等待时间"""
-        time.sleep(random.uniform(min_s, max_s))
 
-    def move_mouse_human(self, sb):
-        """模拟人类鼠标晃动预热"""
-        try:
-            # 在页面不同位置“晃悠”一下鼠标，打破机器人直线模式
-            for _ in range(3):
-                x = random.randint(100, 800)
-                y = random.randint(100, 600)
-                sb.slow_click(f"body", force=True) # 借用 slow_click 的移动特性，或者直接用 move_to
-                time.sleep(random.uniform(0.5, 1.2))
-        except: pass
+def log(level, msg):
+    print(f"[{level}] {msg}")
 
-    def send_telegram_notify(self, message, photo_path=None):
-        """发送 Telegram 通知 (带图片)"""
-        if not TG_TOKEN or not TG_CHAT_ID:
-            self.log("⚠️ 未配置 TG_TOKEN 或 TG_CHAT_ID，跳过推送。")
-            return
-        
-        try:
-            if photo_path and os.path.exists(photo_path):
-                url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
-                with open(photo_path, 'rb') as f:
-                    # caption 参数用于发送带文字的图片
-                    requests.post(url, data={'chat_id': TG_CHAT_ID, 'caption': message}, files={'photo': f})
-            else:
-                url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-                requests.post(url, data={'chat_id': TG_CHAT_ID, 'text': message})
-            
-            self.log("✅ TG 推送已发送")
-        except Exception as e:
-            self.log(f"❌ TG 推送失败: {e}")
 
-    def has_turnstile(self, sb):
-        selectors = [
-            'iframe[src*="turnstile"]',
-            'iframe[src*="challenges.cloudflare.com"]',
-            'input[name="cf-turnstile-response"]'
-        ]
+def send_tg_photo(token, chat_id, path, caption=""):
+    if not (token and chat_id and os.path.exists(path)):
+        return
+    try:
+        with open(path, "rb") as f:
+            requests.post(
+                f"https://api.telegram.org/bot{token}/sendPhoto",
+                files={"photo": f},
+                data={"chat_id": chat_id, "caption": caption},
+                timeout=30,
+            )
+        log("INFO", "Telegram 截图发送成功")
+    except Exception as e:
+        log("ERROR", f"Telegram 截图发送失败: {e}")
 
-        for s in selectors:
-            try:
-                if sb.is_element_present(s):
-                    return True
-            except:
-                pass
 
+def screenshot(sb, name):
+    os.makedirs(SS_DIR, exist_ok=True)
+    path = os.path.join(SS_DIR, f"{name}.png")
+    try:
+        sb.save_screenshot(path)
+        log("INFO", f"截图: {name}")
+        return path
+    except Exception as e:
+        log("ERROR", f"截图失败 ({name}): {e}")
+        return ""
+
+
+def dump_html(sb, name):
+    os.makedirs(SS_DIR, exist_ok=True)
+    try:
+        with open(os.path.join(SS_DIR, f"{name}.html"), "w", encoding="utf-8") as f:
+            f.write(sb.get_page_source())
+    except Exception:
+        pass
+
+
+def finish(sb, tg_token, tg_chat_id, name, caption):
+    dump_html(sb, name)
+    img = screenshot(sb, name)
+    if img:
+        send_tg_photo(tg_token, tg_chat_id, img, caption)
+
+
+def mask_email(email):
+    try:
+        local, domain = (email or "").split("@", 1)
+        if len(local) <= 2:
+            masked = local[0] + "*"
+        else:
+            masked = local[0] + "*" * (len(local) - 2) + local[-1]
+        return f"{masked}@{domain}"
+    except Exception:
+        return "***"
+
+
+def parse_account(raw):
+    value = (raw or "").strip()
+    index = value.find(":")
+    if index <= 0 or index == len(value) - 1:
+        raise ValueError("ACCOUNTS 格式错误，应为 邮箱:密码")
+    return value[:index].strip(), value[index + 1:].strip()
+
+
+def is_signed(html):
+    if "今日已签到" in html:
+        return True
+    if "btn btn-success" in html and "已签到" in html:
+        return True
+    if "disabled" in html and "已签到" in html:
+        return True
+    if "立即签到" in html or "btn-signin" in html:
         return False
+    if "签到记录" in html:
+        return True
+    return False
 
-    def run(self):
-        self.log("=" * 40)
-        self.log("🚀 Ulzix - 签到流程")
-        self.log("=" * 40)
-        self.log("🎯 正在启动 Chrome 浏览器...")
-        
-        # 使用 headed=True 强制有头模式渲染到 VNC
+
+def extract_points(html):
+    match = re.search(r'data-points="(\d+)"', html)
+    return match.group(1) if match else "未知"
+
+
+def build_result_caption(account, result_text, before_points=None, current_points=None, fail_reason=None):
+    lines = [
+        "Ulzix 每日签到",
+        f"🎮 账号：{account}",
+        f"📊 签到结果: {result_text}",
+    ]
+    if before_points is not None:
+        lines.append(f"🎉 签到前积分: {before_points}")
+    if current_points is not None:
+        lines.append(f"💰 当前积分: {current_points}")
+    if fail_reason:
+        lines.append(f"❌ 失败原因: {fail_reason}")
+    return "\n".join(lines)
+
+
+def handle_turnstile(sb, scene="page", max_attempts=3):
+    log("INFO", f"[{scene}] 开始处理 Turnstile 验证")
+    sb.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    time.sleep(2)
+
+    for attempt in range(max_attempts):
+        log("INFO", f"[{scene}] Turnstile 尝试 {attempt + 1}/{max_attempts}")
+        try:
+            sb.uc_gui_handle_captcha()
+            log("INFO", f"[{scene}] 已调用 uc_gui_handle_captcha")
+        except Exception as e:
+            log("WARN", f"[{scene}] uc_gui_handle_captcha 失败: {e}")
+
+        start = time.time()
+        while time.time() - start < 20:
+            token_ready = sb.execute_script(
+                """
+                var inp = document.querySelector('input[name="cf-turnstile-response"]');
+                return !!(inp && inp.value && inp.value.length > 20);
+                """
+            )
+            if token_ready:
+                log("INFO", f"[{scene}] ✅ Turnstile 通过")
+                screenshot(sb, f"turnstile_ok_{scene}")
+                return True
+
+            success = sb.execute_script(
+                """
+                var el = document.getElementById('success');
+                return el && getComputedStyle(el).display !== 'none';
+                """
+            )
+            if success:
+                log("INFO", f"[{scene}] Turnstile 显示成功元素")
+                return True
+            time.sleep(1)
+
+        log("WARN", f"[{scene}] 当前尝试超时，重试...")
+        sb.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(2)
+
+    log("ERROR", f"[{scene}] Turnstile 验证失败")
+    screenshot(sb, f"turnstile_fail_{scene}")
+    return False
+
+
+def login(sb, email, password):
+    log("INFO", "打开登录页")
+    sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=8)
+    time.sleep(5)
+    screenshot(sb, "01_login_loaded")
+    
+    # 【预留提示】如果目标网站的登录页也有 Turnstile 验证，去掉下面这行开头的注释：
+    # handle_turnstile(sb, "login")
+
+    sb.wait_for_element_visible("#email", timeout=15)
+
+    log("INFO", f"填写邮箱: {mask_email(email)}")
+    # 【修复 3】精简输入操作，sb.type 本身自带 clear 清空功能
+    sb.type("#email", email)
+    time.sleep(0.5)
+
+    sb.type("#password", password)
+    time.sleep(0.5)
+
+    screenshot(sb, "02_form_filled")
+
+    sb.wait_for_element_visible('button[type="submit"]', timeout=10)
+    sb.click('button[type="submit"]')
+    time.sleep(6)
+
+    if "login" in sb.get_current_url().lower():
+        log("ERROR", "登录失败，仍停留在登录页面")
+        return False, "登录失败"
+
+    log("INFO", "登录成功")
+    screenshot(sb, "03_login_success")
+    return True, None
+
+
+def do_signin(sb):
+    log("INFO", "打开签到页")
+    sb.uc_open_with_reconnect(SIGNIN_URL, reconnect_time=8)
+    time.sleep(5)
+    screenshot(sb, "04_signin_loaded")
+
+    # 只等 body 确认页面加载完成
+    sb.wait_for_element_visible("body", timeout=10)
+
+    initial_html = sb.get_page_source()
+    before_points = extract_points(initial_html)
+    if is_signed(initial_html):
+        log("INFO", "今日已签到")
+        return True, "今日已签到", before_points, before_points, None
+
+    if not handle_turnstile(sb, "signin"):
+        return False, "签到失败", before_points, before_points, "签到验证失败"
+
+    # 【修复 2】使用更安全的 is_element_visible 防止找不到元素导致脚本崩溃
+    if not sb.is_element_visible("#btn-signin"):
+        log("ERROR", "找不到立即签到按钮")
+        return False, "签到失败", before_points, before_points, "找不到签到按钮"
+
+    sb.click("#btn-signin")
+    log("INFO", "已点击立即签到")
+    time.sleep(3)
+
+    for i in range(10):
+        time.sleep(2)
+        html = sb.get_page_source()
+        if is_signed(html):
+            current_points = extract_points(html)
+            log("INFO", f"签到成功，积分: {current_points}")
+            return True, "签到成功", before_points, current_points, None
+        log("INFO", f"等待签到结果... ({i + 1})")
+
+    current_points = extract_points(sb.get_page_source())
+    log("WARN", "签到状态未确认")
+    return False, "签到失败", before_points, current_points, "未确认签到状态"
+
+
+def Ulzix_checkin():
+    tg_token = os.getenv("TG_BOT_TOKEN")
+    tg_chat_id = os.getenv("TG_CHAT_ID")
+    account_raw = os.getenv("ACCOUNTS")
+    if not account_raw:
+        return False, "缺少 ACCOUNTS"
+
+    try:
+        email, password = parse_account(account_raw)
+    except Exception as e:
+        return False, str(e)
+
+    proxy = PROXY_URL.strip() if PROXY_URL else ""
+    if proxy:
+        log("INFO", f"使用代理: {proxy}")
+    else:
+        log("INFO", "未配置代理，直连")
+
+    display = None
+    if platform.system().lower() == "linux" and not os.environ.get("DISPLAY"):
+        try:
+            display = Display(visible=False, size=(1280, 720))
+            display.start()
+            log("INFO", "虚拟显示已启动")
+        except Exception as e:
+            return False, f"虚拟显示失败: {e}"
+
+    try:
         with SB(
-            uc=True,            # 启用反检测模式
-            test=True, 
-            headed=True,        # 关键：强制有头模式
-            headless=False,     # 明确禁用 headless
-            xvfb=False,         # 禁用内部虚拟显示器，使用系统 DISPLAY
+            uc=True,
             locale="zh-CN",
-            chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--window-position=0,0,--start-maximized,--lang=zh-CN",
-            proxy=PROXY_URL if PROXY_URL else None
+            headless2=False,
+            proxy=proxy if proxy else None,
         ) as sb:
-            try:
-                self.log("✅ 浏览器已启动！")
-                
-                # ... (省略中间步骤，保持原有逻辑不变) ...
-                
-                # 1. IP 检测
-                self.log("🌍 正在检测出口 IP...")
-                try:
-                    sb.open("https://api.ipify.org?format=json")
-                    ip_val = json.loads(re.search(r'\{.*\}', sb.get_text("body")).group(0)).get('ip', 'Unknown')
-                    parts = ip_val.split('.')
-                    self.log(f"✅ 当前出口 IP: {parts[0]}.{parts[1]}.***.{parts[-1]}")
-                except:
-                    self.log("⚠️ IP 检测跳过...")
+            ok, reason = login(sb, email, password)
+            if not ok:
+                finish(
+                    sb,
+                    tg_token,
+                    tg_chat_id,
+                    "login_failed",
+                    build_result_caption(email, "签到失败", fail_reason=reason),
+                )
+                return False, reason
 
-                # 2. 访问登录首页并登录
-                self.log("🔗 访问登录首页...")
-                sb.uc_open_with_reconnect(LOGIN_PANEL, reconnect_time=25)
-                time.sleep(5)
-                self.log("🖱️ 开始输入账户密码并登录...")
-                # 输入邮箱
-                sb.type("#email", EMAIL)
-                # 输入密码
-                sb.type("#password", PASSWORD)
-                # 点击登录按钮
-                sb.click("button[type='submit']")
-                # 等待跳转
-                time.sleep(10)
-                #login_screenshot = f"{self.screenshot_dir}/acc.png"
-                #sb.save_screenshot(login_screenshot)
-                #self.send_telegram_notify("登录页面", login_screenshot)
+            success, result_text, before_points, current_points, fail_reason = do_signin(sb)
+            finish(
+                sb,
+                tg_token,
+                tg_chat_id,
+                "signin_ok" if success else "signin_fail",
+                build_result_caption(email, result_text, before_points, current_points, fail_reason),
+            )
+            return success, result_text if success else fail_reason
+    except Exception as e:
+        log("ERROR", f"脚本异常: {e}")
+        import traceback
+        traceback.print_exc()
+        return False, f"异常: {str(e)[:200]}"
+    finally:
+        if display:
+            display.stop()
 
-                # 3. 进入签到页面
-                self.log("🔗 进入签到页面")
-                sb.uc_open_with_reconnect(CHECKIN_URL, reconnect_time=25)
-                time.sleep(10)
-                # 当前分数获取
-                before_points = sb.get_text(".points-format")
-                self.log(f"✅ 当前分数：{before_points}")
-                #checkin_screenshot = f"{self.screenshot_dir}/checkin.png"
-                #sb.save_screenshot(checkin_screenshot)
-                #self.send_telegram_notify("签到页面", checkin_screenshot)                
-
-                # 4. Cloudflare Turnstile验证
-                self.log("⏳ 开始检查Turnstile验证")
-                time.sleep(15)
-
-                if self.has_turnstile(sb):
-                    token = None
-                    for i in range(2):
-                        self.log(f"第 {i+1} 次尝试")
-                        self.move_mouse_human(sb)
-                        sb.uc_gui_click_captcha()
-                        # 等待token
-                        for _ in range(15):
-                            time.sleep(10)
-                            token = sb.get_attribute('input[name="cf-turnstile-response"]',"value")
-                            if token:
-                                break
-                        if token:
-                            self.log("✅ Cloudflare Turnstile验证成功")
-                            print(f"Token length={len(token)}")
-                            break
-                        self.log("⚠️ click后没有token，尝试handle")
-                        self.move_mouse_human(sb)
-                        sb.uc_gui_handle_captcha()
-                        time.sleep(10)
-                        # handle后再次检查
-                        token = sb.get_attribute('input[name="cf-turnstile-response"]',"value")
-                        if token:
-                            self.log("✅ handle后获取Token")
-                            break
-                    if not token:
-                        self.log("❌ Cloudflare验证失败")
-                        cf_screenshot = f"{self.screenshot_dir}/cf_failed.png"
-                        sb.save_screenshot(cf_screenshot)
-                        self.send_telegram_notify("CF失败", cf_screenshot)
-                        return
-                    self.log("🎉 CF验证完成")
-                
-                #cf_screenshot = f"{self.screenshot_dir}/cf.png"
-                #sb.save_screenshot(cf_screenshot)
-                #self.send_telegram_notify("Cloudflare", cf_screenshot)
-
-                # 5.签到操作
-                if not sb.is_element_present("#btn-signin"):
-                    self.log("✅ 今日已签到")
-                    # 连续签到天数获取
-                    sign_days = sb.get_text(".text-muted.mb-3.mb-lg-4 span.fw-bold")
-                    self.log(f"✅ 连续签到天数：{sign_days}")
-                    final_screenshot = f"{self.screenshot_dir}/final.png"
-                    sb.save_screenshot(final_screenshot)
-                    self.send_telegram_notify(f"🎉Ulzix 签到流程\n✅今日已签到\n🚀当前积分：{before_points}\n🕒连续签到天数：{sign_days}", final_screenshot)
-                else:
-                    sb.click("#btn-signin")
-                    self.log("✅ 已点击签到按钮")
-                    time.sleep(5)
-                    # 再次进入签到页面
-                    sb.uc_open_with_reconnect(CHECKIN_URL, reconnect_time=25)
-                    time.sleep(5)
-                    # 连续签到天数获取
-                    sign_days = sb.get_text(".text-muted.mb-3.mb-lg-4 span.fw-bold")
-                    # 当前分数获取
-                    after_points = sb.get_text(".points-format")
-                    self.log(f"✅ 当前分数：{after_points}")
-                    final_screenshot = f"{self.screenshot_dir}/final.png"
-                    sb.save_screenshot(final_screenshot)
-                    self.send_telegram_notify(f"🎉Ulzix 签到流程\n✅签到成功,签到前积分：{before_points}\n🚀签到后积分：{after_points}\n🕒连续签到天数：{sign_days}", final_screenshot)
-                    
-
-            except Exception as e:
-                self.log(f"❌ 运行异常: {e}")
-                import traceback
-                traceback.print_exc()
-                sb.save_screenshot(f"{self.screenshot_dir}/error.png")
+    return False, "未知错误"  
 
 
 if __name__ == "__main__":
-    UlzixCheckin().run()
+    ok, msg = Ulzix_checkin()
+    log("INFO", msg)
+    if not ok:
+        sys.exit(1)
