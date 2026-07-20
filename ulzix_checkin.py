@@ -12,6 +12,7 @@ LOGIN_URL = "https://idc-new.ulzix.com/login"
 SIGNIN_URL = "https://idc-new.ulzix.com/pointmall/signin"
 SS_DIR = "screenshots"
 
+# 【修复】防止本地无代理时强制连 8080 导致崩溃
 PROXY_URL = os.getenv("BROWSER_PROXY", "")
 
 
@@ -83,18 +84,20 @@ def parse_account(raw):
     return value[:index].strip(), value[index + 1:].strip()
 
 
-# 【终极修复】完美的签到状态识别逻辑
+# 【修复核心】彻底根除“已连续签到”带来的误杀 Bug
 def is_signed(html):
-    # 1. 优先捕获签到成功后的弹窗/提示词
-    if "签到成功" in html or "今日已签到" in html:
+    if "今日还未签到" in html:
+        return False
+    if "今日已签到" in html:
         return True
-        
-    # 2. 如果页面上还有“今日还未签到”或者“立即签到”这几个字，说明绝对没签到
-    if "今日还未签到" in html or "立即签到" in html:
+    
+    if 'id="btn-signin"' in html or "立即签到" in html:
         return False
         
-    # 3. 如果未签到的标志词都消失了（比如按钮文字变成了“已签到”），说明签到成功！
-    return True
+    if "签到记录" in html:
+        return True
+        
+    return False
 
 
 def extract_points(html):
@@ -120,6 +123,7 @@ def build_result_caption(account, result_text, before_points=None, current_point
 def handle_turnstile(sb, scene="page", max_attempts=3):
     log("INFO", f"[{scene}] 开始处理 Turnstile 验证")
     sb.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    # 【修复】增加刚进入时的缓冲时间，给慢速 CF 框架加载的余地
     time.sleep(5)
 
     for attempt in range(max_attempts):
@@ -131,6 +135,7 @@ def handle_turnstile(sb, scene="page", max_attempts=3):
             log("WARN", f"[{scene}] uc_gui_handle_captcha 失败: {e}")
 
         start = time.time()
+        # 【终极修复】熬鹰模式：最多等待 150 秒（两分半），专治 CF 故意拖延加载
         while time.time() - start < 150:
             token_ready = sb.execute_script(
                 """
@@ -169,9 +174,13 @@ def login(sb, email, password):
     time.sleep(5)
     screenshot(sb, "01_login_loaded")
     
+    # 如果目标网站的登录页也有 Turnstile 验证，把下面这行开头的 '#' 删掉：
+    # handle_turnstile(sb, "login")
+
     sb.wait_for_element_visible("#email", timeout=15)
 
     log("INFO", f"填写邮箱: {mask_email(email)}")
+    # 【修复】精简输入操作
     sb.type("#email", email)
     time.sleep(0.5)
 
@@ -197,6 +206,7 @@ def do_signin(sb):
     log("INFO", "打开签到页")
     sb.uc_open_with_reconnect(SIGNIN_URL, reconnect_time=8)
     
+    # 【终极修复】进入签到页面后，直接硬等 30 秒，给代理节点和 CF 充足的加载时间
     time.sleep(30)
     screenshot(sb, "04_signin_loaded")
 
@@ -205,6 +215,7 @@ def do_signin(sb):
     initial_html = sb.get_page_source()
     before_points = extract_points(initial_html)
     
+    # 这里使用的是全新修复的 is_signed 函数
     if is_signed(initial_html):
         log("INFO", "今日已签到")
         return True, "今日已签到", before_points, before_points, None
@@ -212,6 +223,7 @@ def do_signin(sb):
     if not handle_turnstile(sb, "signin"):
         return False, "签到失败", before_points, before_points, "签到验证失败"
 
+    # 【修复】安全获取按钮状态，规避闪退风险
     if not sb.is_element_visible("#btn-signin"):
         log("ERROR", "找不到立即签到按钮")
         return False, "签到失败", before_points, before_points, "找不到签到按钮"
