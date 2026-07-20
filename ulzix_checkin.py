@@ -84,19 +84,22 @@ def parse_account(raw):
     return value[:index].strip(), value[index + 1:].strip()
 
 
-# 【修复核心】彻底根除“已连续签到”带来的误杀 Bug
+# 【修复核心】只修复判定不准确的问题：
+# 成功后页面文案是“签到成功 / 已连续签到”，之前逻辑没覆盖，
+# 反而命中了残留的 btn-signin/立即签到 而误判为未签到。
+# 现在把明确的成功/已签文案作为最高优先级，去掉会误判的“签到记录”兜底。
 def is_signed(html):
+    # 明确的成功 / 已签文案，优先级最高
+    if any(k in html for k in ("签到成功", "今日已签到", "已连续签到")):
+        return True
+
     if "今日还未签到" in html:
         return False
-    if "今日已签到" in html:
-        return True
-    
+
+    # 只有在没有任何成功文案时，按钮才代表“还没签”
     if 'id="btn-signin"' in html or "立即签到" in html:
         return False
-        
-    if "签到记录" in html:
-        return True
-        
+
     return False
 
 
