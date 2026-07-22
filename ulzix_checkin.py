@@ -109,6 +109,13 @@ def extract_points(html):
     return match.group(1) if match else "未知"
 
 
+def points_to_int(value):
+    try:
+        return int(str(value).replace(",", "").strip())
+    except Exception:
+        return None
+
+
 def build_result_caption(account, result_text, before_points=None, current_points=None, fail_reason=None):
     lines = [
         "Ulzix 每日签到",
@@ -236,13 +243,24 @@ def do_signin(sb):
     log("INFO", "已点击立即签到")
     time.sleep(3)
 
+    # 【改用积分判定】只要签到后积分比签到前增加，即视为成功；
+    # 文案判定仅作兜底（应对积分读取失败的情况）。
+    before_val = points_to_int(before_points)
     for i in range(10):
         time.sleep(2)
         html = sb.get_page_source()
-        if is_signed(html):
-            current_points = extract_points(html)
-            log("INFO", f"签到成功，积分: {current_points}")
+        current_points = extract_points(html)
+        current_val = points_to_int(current_points)
+
+        if before_val is not None and current_val is not None and current_val > before_val:
+            log("INFO", f"积分增加确认签到成功: {before_points} -> {current_points}")
             return True, "签到成功", before_points, current_points, None
+
+        # 兜底：积分没读到时，靠成功文案确认
+        if is_signed(html):
+            log("INFO", f"文案确认签到成功，积分: {current_points}")
+            return True, "签到成功", before_points, current_points, None
+
         log("INFO", f"等待签到结果... ({i + 1})")
 
     current_points = extract_points(sb.get_page_source())
